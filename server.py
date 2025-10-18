@@ -126,3 +126,9 @@ def webhook():
         color = 0x2ECC71 if side=="buy" else 0xE74C3C
     )
     return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    import os
+    port = int(os.getenv("PORT", "10000"))
+    # ローカルで試すとき用。Render 本番では Gunicorn が使うのでここは実行されません。
+    app.run(host="0.0.0.0", port=port)
