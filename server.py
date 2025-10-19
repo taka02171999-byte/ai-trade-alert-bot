@@ -1,5 +1,4 @@
-# server.py — AIりんご式 本番用（絵文字1種 + ping無視 + 日本語Embed）
-# 依存: flask, requests
+# server.py — AIりんご式（完全pingブロック + 日本語通知）
 
 import os, csv, json, requests
 from pathlib import Path
@@ -8,7 +7,6 @@ from flask import Flask, request, jsonify, Response
 from threading import Lock
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
-
 LOG_DIR = Path("logs")
 CSV_PATH = LOG_DIR / "signals.csv"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -23,7 +21,6 @@ if not CSV_PATH.exists():
 
 csv_lock = Lock()
 
-# === 共通関数 ===
 def jst_now_iso():
     return datetime.now(timezone.utc).astimezone(
         timezone(timedelta(hours=9))
@@ -32,10 +29,9 @@ def jst_now_iso():
 def _fmt(x):
     return "-" if x is None else str(x)
 
-# === Discord通知（日本語 + シンプル絵文字） ===
+# === Discord Embed構築 ===
 def _build_signal_embed(data: dict):
     side = (data.get("side") or "").lower()
-
     SIDE = {
         "buy":  {"emoji": "🟢", "title": "買いシグナル", "color": 0x2ecc71},
         "sell": {"emoji": "🔴", "title": "売りシグナル", "color": 0xe74c3c},
@@ -44,32 +40,18 @@ def _build_signal_embed(data: dict):
     }
     meta = SIDE.get(side, {"emoji": "📈", "title": "シグナル", "color": 0x95a5a6})
 
-    sym = _fmt(data.get("symbol"))
-    tf  = _fmt(data.get("tf"))
-    c   = _fmt(data.get("c"))
-
-    title = f"{meta['emoji']} {meta['title']}｜{sym}｜{tf}｜価格 {c}"
-
-    fields = [
-        {"name": "銘柄", "value": sym, "inline": True},
-        {"name": "時間足", "value": tf, "inline": True},
-        {"name": "時刻", "value": _fmt(data.get("time")), "inline": False},
-        {"name": "O / H / L / C", "value": f"{_fmt(data.get('o'))} / {_fmt(data.get('h'))} / {_fmt(data.get('l'))} / **{c}**", "inline": False},
-        {"name": "出来高 / VWAP / ATR", "value": f"{_fmt(data.get('v'))} / {_fmt(data.get('vwap'))} / {_fmt(data.get('atr'))}", "inline": False},
-    ]
-
-    if data.get("tp") or data.get("sl"):
-        fields.append({
-            "name": "参考TP / SL",
-            "value": f"{_fmt(data.get('tp'))} / {_fmt(data.get('sl'))}",
-            "inline": True
-        })
-
+    title = f"{meta['emoji']} {meta['title']}｜{_fmt(data.get('symbol'))}｜{_fmt(data.get('tf'))}｜価格 {_fmt(data.get('c'))}"
     embed = {
         "title": title,
         "color": meta["color"],
         "timestamp": jst_now_iso(),
-        "fields": fields,
+        "fields": [
+            {"name": "銘柄", "value": _fmt(data.get("symbol")), "inline": True},
+            {"name": "時間足", "value": _fmt(data.get("tf")), "inline": True},
+            {"name": "時刻", "value": _fmt(data.get("time")), "inline": False},
+            {"name": "O / H / L / C", "value": f"{_fmt(data.get('o'))} / {_fmt(data.get('h'))} / {_fmt(data.get('l'))} / **{_fmt(data.get('c'))}**", "inline": False},
+            {"name": "出来高 / VWAP / ATR", "value": f"{_fmt(data.get('v'))} / {_fmt(data.get('vwap'))} / {_fmt(data.get('atr'))}", "inline": False},
+        ],
         "footer": {"text": "AIりんご式"}
     }
     return {"embeds": [embed]}
@@ -85,9 +67,10 @@ def _post_discord(payload):
         print(f"[error] Discord通知失敗: {e}")
 
 def notify_from_tv(data: dict):
-    # ✅ ping は完全スルー（Discordへ通知しない）
-    if str(data.get("ping")).lower() in ("true", "1", "ping", "keepalive"):
-        print("[info] ping / keepalive受信 → 無視")
+    # ✅ ping関連の全パターンをブロック
+    val = str(data.get("ping") or "").lower().strip()
+    if val in ("true", "1", "ping", "keepalive", "yes"):
+        print("[info] ping / keepalive受信 → 無視 (Discord送信なし)")
         return
     _post_discord(_build_signal_embed(data))
 
@@ -118,15 +101,8 @@ app = Flask(__name__)
 def root():
     return "ok", 200
 
-@app.get("/signals")
-def get_signals():
-    if not CSV_PATH.exists():
-        return Response("", mimetype="text/csv")
-    return Response(CSV_PATH.read_text("utf-8"), mimetype="text/csv")
-
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # /webhook?ping=1 のようなGETはDiscordへ通知せずにOKだけ返す
     if request.method == "GET" and request.args.get("ping"):
         print("[info] GET ping -> 応答のみ (Discord通知なし)")
         return jsonify({"ok": True, "ping": True})
