@@ -1,209 +1,109 @@
-# server.py — AIりんご式 受信/配信用 Flask サーバ
-# - TradingView からの Webhook を受け取り（/signal）
-# - CSV に追記して（logs/signals.csv）
-# - Discord に即通知
-# - CSV をダウンロード配布（/signals）
-# Render では Start Command を:
-#   gunicorn -w 1 -k gthread -b 0.0.0.0:$PORT server:app --timeout 120
-# にしてください。
-
-from flask import Flask, request, jsonify, send_file
+# server.py  — AIりんご式 Webhook 受け口 + CSV蓄積 + 健康チェック
+# 必要ライブラリ: flask, requests
+import os, csv
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-import os, csv, json, requests
+from flask import Flask, request
 
+# ====== 基本設定 ======
 app = Flask(__name__)
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+LOG_DIR  = Path("logs")
+CSV_PATH = LOG_DIR / "signals.csv"
 
-# ===== 環境変数 =====
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")  # 必須（無いと通知はスキップ）
+# CSVヘッダ（TradingViewから保存したい項目。必要に応じて追加OK）
+CSV_HEADERS = [
+    "ts_iso", "symbol", "side", "o", "h", "l", "c", "v", "vwap", "atr", "tf"
+]
 
-# ===== パス・ファイル =====
-BASE_DIR   = Path(__file__).resolve().parent
-LOG_DIR    = BASE_DIR / "logs"
-LOG_FILE   = LOG_DIR / "signals.csv"          # 受信シグナルの保存先
-PARAMS_FILE = BASE_DIR / "params.json"        # 最適化で更新される係数（無くてもOK）
-
-LOG_DIR.mkdir(exist_ok=True)
-
-# ===== 共通ユーティリティ =====
-def jst_now_text() -> str:
-    """JSTの 'YYYY-MM-DD HH:MM:SS JST' 文字列"""
+# ====== ユーティリティ ======
+def jst_now_iso():
     return datetime.now(timezone.utc).astimezone(
         timezone(timedelta(hours=9))
-    ).strftime("%Y-%m-%d %H:%M:%S JST")
+    ).isoformat(timespec="seconds")
 
-def read_params_for(symbol: str) -> dict:
-    """
-    銘柄別 SL/TP のATR倍率を params.json から取得。
-    無ければデフォルト（sl×0.9 / tp×1.7）
-    """
-    default = {"sl_atr": 0.9, "tp_atr": 1.7}
-    try:
-        if PARAMS_FILE.exists():
-            data = json.loads(PARAMS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data.get(symbol, default)
-    except Exception as e:
-        print("params.json read error:", e)
-    return default
+def ensure_csv():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CSV_PATH.exists():
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=CSV_HEADERS).writeheader()
 
-def post_discord_embed(title: str, description: str, fields=None, color: int = 0x2ECC71):
-    """Discord に埋め込みで通知（Webhook未設定ならスキップ）"""
+def notify_discord(text: str):
     if not DISCORD_WEBHOOK:
-        print("no DISCORD_WEBHOOK -> skip discord")
+        print("[warn] DISCORD_WEBHOOK not set; skip notify", flush=True)
         return
-    payload = {
-        "embeds": [{
-            "title": title,
-            "description": description,
-            "color": color,
-            "fields": fields or [],
-            "footer": {"text": "AIりんご式"},
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }]
-    }
     try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        print("discord status:", r.status_code)
+        import requests
+        requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=8)
+        print("[info] discord notified", flush=True)
     except Exception as e:
-        print("discord error:", e)
+        print(f"[error] discord notify: {e}", flush=True)
 
-def log_signal(row: dict):
-    """CSVに1行追記。初回はヘッダを書き出し。"""
-    headers = [
-        "time","symbol","side","tf",
-        "o","h","l","c","v","vwap","atr",
-        "entry","tp","sl"
-    ]
-    new_file = not LOG_FILE.exists()
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        if new_file:
-            w.writeheader()
-        w.writerow({k: row.get(k, "") for k in headers})
-    print("logged:", row)
+def pick(d: dict, k: str, default=""):
+    v = d.get(k)
+    if v is None: return default
+    return str(v)
 
-# ===== ルート =====
-@app.route("/")
+# ====== ルート（起動確認） ======
+@app.route("/", methods=["GET"])
 def root():
-    return "ok"
+    return "ok", 200
 
-@app.route("/healthz")
-def healthz():
-    return jsonify({"ok": True, "time": jst_now_text()})
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "time": jst_now_iso()}, 200
 
-@app.route("/signals", methods=["GET"])
-def download_signals():
-    """
-    収集した CSV をそのまま配布。
-    ※ optimizer（夜間学習）が HTTP で取りに来る想定
-    """
-    if LOG_FILE.exists():
-        return send_file(LOG_FILE, as_attachment=True, download_name="signals.csv")
-    return "no data yet", 200
+# ====== TradingView → Webhook 受け口（GET/POST/末尾スラッシュ両対応） ======
+@app.route("/webhook",  methods=["GET","POST"])
+@app.route("/webhook/", methods=["GET","POST"])
+def webhook():
+    ct  = request.headers.get("Content-Type", "")
+    raw = request.get_data(as_text=True) or ""
+    js  = request.get_json(silent=True) or {}
+    print(f"[webhook] {request.method} ct={ct} len={len(raw)} body={raw[:500]}", flush=True)
 
-@app.route("/signal", methods=["POST"])
-def signal():
-    """
-    TradingView Webhook 受信口。
-    受け取りフォーマットは柔軟に吸収：
-      {
-        "symbol": "USDJPY",     # or "ticker"
-        "type": "buy|sell|tp|sl",   # or "side"
-        "price": 150.12,        # or "c" / "close"
-        "atr": 0.25,
-        "tf": "5",              # or "timeframe" / "interval"
-        "o":..., "h":..., "l":..., "c":..., "v":..., "vwap":...
-      }
-    """
-    try:
-        d = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        d = {}
+    # 1) テスト: ?ping=1 または {"ping": true} で即200 & Discord通知
+    if request.args.get("ping") == "1" or (isinstance(js, dict) and js.get("ping")):
+        notify_discord(f"✅ Webhook test OK {jst_now_iso()}")
+        return "ok", 200
 
-    print("incoming:", d)
-
-    # 対応キーを吸収
-    symbol = (d.get("symbol") or d.get("ticker") or "UNKNOWN")
-    side   = (d.get("type") or d.get("side") or "buy").lower()
-    tf     =  d.get("tf") or d.get("timeframe") or d.get("interval") or ""
-
-    def f(x, default=0.0):
-        try: return float(x)
-        except: return default
-
-    # 価格群
-    o    = f(d.get("o"))
-    h    = f(d.get("h"))
-    l    = f(d.get("l"))
-    c    = f(d.get("c") or d.get("close") or d.get("price"))
-    vwap = f(d.get("vwap"))
-    atr  = f(d.get("atr"))
-    v    = d.get("v") or d.get("volume") or ""
-
-    # params.json から係数を取って SL/TP を計算
-    coeff  = read_params_for(symbol)
-    slx = float(coeff.get("sl_atr", 0.9))
-    tpx = float(coeff.get("tp_atr", 1.7))
-
-    entry = c
-    if side == "buy":
-        sl = entry - atr * slx
-        tp = entry + atr * tpx
-    elif side == "sell":
-        sl = entry + atr * slx
-        tp = entry - atr * tpx
-    else:
-        # tp/sl 通知など種別が既定外の時は、そのまま値を通す
-        sl = d.get("sl")
-        tp = d.get("tp")
-
-    # CSVへ保存
+    # 2) 実弾: 受け取ったJSONをCSVへ追記（可能な項目だけ拾う）
+    ensure_csv()
     row = {
-        "time": d.get("time") or jst_now_text(),
-        "symbol": symbol,
-        "side": side,
-        "tf": tf,
-        "o": o, "h": h, "l": l, "c": c, "v": v,
-        "vwap": vwap, "atr": atr,
-        "entry": entry, "tp": tp, "sl": sl
+        "ts_iso": jst_now_iso(),
+        "symbol": pick(js, "symbol"),
+        "side":   pick(js, "side"),
+        "o":      pick(js, "o"),
+        "h":      pick(js, "h"),
+        "l":      pick(js, "l"),
+        "c":      pick(js, "c"),
+        "v":      pick(js, "v"),
+        "vwap":   pick(js, "vwap"),
+        "atr":    pick(js, "atr"),
+        "tf":     pick(js, "tf"),
     }
-    try:
-        log_signal(row)
-    except Exception as e:
-        print("csv log error:", e)
+    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
 
-    # Discordへ通知
-    title_map = {
-        "buy":  "🟢 買いシグナル",
-        "sell": "🔴 売りシグナル",
-        "tp":   "💰 利確サイン",
-        "sl":   "⚠️ 損切りサイン"
-    }
-    color_map = {
-        "buy":  0x2ECC71,
-        "sell": 0xE74C3C,
-        "tp":   0xF1C40F,
-        "sl":   0xE67E22
-    }
-    fields = [
-        {"name":"足",   "value": tf or "-",          "inline": True},
-        {"name":"終値", "value": f"{c:.4f}",         "inline": True},
-        {"name":"ATR",  "value": f"{float(atr):.4f}","inline": True},
-        {"name":"利確", "value": f"{tp if tp is None else f'{float(tp):.4f}'}", "inline": True},
-        {"name":"損切り","value": f"{sl if sl is None else f'{float(sl):.4f}'}","inline": True},
-    ]
-    desc = f"銘柄: **{symbol}**\n時刻: {jst_now_text()}"
-    post_discord_embed(
-        title_map.get(side, "📈 シグナル"),
-        desc,
-        fields=fields,
-        color=color_map.get(side, 0x3498DB)
+    # 3) Discordにも抜粋を通知（長文防止で一部だけ）
+    notify_discord(
+        f"📩 Signal {row['symbol']} {row['side']} c={row['c']} v={row['v']} tf={row['tf']} @ {row['ts_iso']}"
     )
+    return "ok", 200
 
-    return jsonify({"ok": True})
-    
-# ===== ローカル実行用（Render本番ではGunicornが使う） =====
+# ====== 蓄積CSVのダウンロード（最適化ジョブ用） ======
+@app.route("/signals", methods=["GET"])
+def get_signals():
+    ensure_csv()
+    try:
+        return CSV_PATH.read_text(encoding="utf-8"), 200, {
+            "Content-Type": "text/csv; charset=utf-8"
+        }
+    except Exception as e:
+        print(f"[error] read csv: {e}", flush=True)
+        return "error", 500
+
+# ====== ローカル実行用（RenderではGunicornが使う） ======
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
