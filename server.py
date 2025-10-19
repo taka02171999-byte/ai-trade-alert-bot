@@ -1,4 +1,4 @@
-# server.py — AIりんご式 本番用（雷⚡損切り + Discord Embed対応）
+# server.py — AIりんご式 本番用（絵文字1種 + ping無視 + 日本語Embed）
 # 依存: flask, requests
 
 import os, csv, json, requests
@@ -29,31 +29,47 @@ def jst_now_iso():
         timezone(timedelta(hours=9))
     ).isoformat()
 
-def _fmt(x): return "-" if x is None else str(x)
+def _fmt(x):
+    return "-" if x is None else str(x)
 
-# === Discord通知（日本語 + 絵文字） ===
+# === Discord通知（日本語 + シンプル絵文字） ===
 def _build_signal_embed(data: dict):
     side = (data.get("side") or "").lower()
-    MAP = {
-        "buy":  {"emoji": "🟢", "title": "買いシグナル",   "color": 0x2ecc71},
-        "sell": {"emoji": "🔴", "title": "売りシグナル",   "color": 0xe74c3c},
-        "tp":   {"emoji": "🎯", "title": "利確シグナル",   "color": 0x3498db},
-        # ⚡雷エフェクト損切りシグナル
-        "sl":   {"emoji": "⚡", "title": "⚡緊急損切りシグナル⚡", "color": 0xff0000},
+
+    SIDE = {
+        "buy":  {"emoji": "🟢", "title": "買いシグナル", "color": 0x2ecc71},
+        "sell": {"emoji": "🔴", "title": "売りシグナル", "color": 0xe74c3c},
+        "tp":   {"emoji": "💰", "title": "利確シグナル", "color": 0x3498db},
+        "sl":   {"emoji": "⚡", "title": "損切りシグナル", "color": 0xff0000},
     }
-    meta = MAP.get(side, {"emoji": "📈", "title": "シグナル", "color": 0x95a5a6})
+    meta = SIDE.get(side, {"emoji": "📈", "title": "シグナル", "color": 0x95a5a6})
+
+    sym = _fmt(data.get("symbol"))
+    tf  = _fmt(data.get("tf"))
+    c   = _fmt(data.get("c"))
+
+    title = f"{meta['emoji']} {meta['title']}｜{sym}｜{tf}｜価格 {c}"
+
+    fields = [
+        {"name": "銘柄", "value": sym, "inline": True},
+        {"name": "時間足", "value": tf, "inline": True},
+        {"name": "時刻", "value": _fmt(data.get("time")), "inline": False},
+        {"name": "O / H / L / C", "value": f"{_fmt(data.get('o'))} / {_fmt(data.get('h'))} / {_fmt(data.get('l'))} / **{c}**", "inline": False},
+        {"name": "出来高 / VWAP / ATR", "value": f"{_fmt(data.get('v'))} / {_fmt(data.get('vwap'))} / {_fmt(data.get('atr'))}", "inline": False},
+    ]
+
+    if data.get("tp") or data.get("sl"):
+        fields.append({
+            "name": "参考TP / SL",
+            "value": f"{_fmt(data.get('tp'))} / {_fmt(data.get('sl'))}",
+            "inline": True
+        })
 
     embed = {
-        "title": f"{meta['emoji']} {meta['title']}",
+        "title": title,
         "color": meta["color"],
         "timestamp": jst_now_iso(),
-        "fields": [
-            {"name": "銘柄", "value": _fmt(data.get("symbol")), "inline": True},
-            {"name": "時間足", "value": _fmt(data.get("tf")), "inline": True},
-            {"name": "時刻", "value": _fmt(data.get("time")), "inline": False},
-            {"name": "価格(O/H/L/C)", "value": f"{_fmt(data.get('o'))}/{_fmt(data.get('h'))}/{_fmt(data.get('l'))}/**{_fmt(data.get('c'))}**", "inline": False},
-            {"name": "出来高 / VWAP / ATR", "value": f"{_fmt(data.get('v'))} / {_fmt(data.get('vwap'))} / {_fmt(data.get('atr'))}", "inline": False},
-        ],
+        "fields": fields,
         "footer": {"text": "AIりんご式"}
     }
     return {"embeds": [embed]}
@@ -68,9 +84,10 @@ def _post_discord(payload):
     except Exception as e:
         print(f"[error] Discord通知失敗: {e}")
 
-def notify_from_tv(data):
-    if data.get("ping") is True:
-        _post_discord({"content": f"✅ Webhookテスト成功\n{jst_now_iso()}"})
+def notify_from_tv(data: dict):
+    # ✅ ping は完全スルー（Discordへ通知しない）
+    if str(data.get("ping")).lower() in ("true", "1", "ping", "keepalive"):
+        print("[info] ping / keepalive受信 → 無視")
         return
     _post_discord(_build_signal_embed(data))
 
@@ -98,23 +115,27 @@ def append_csv_row(data):
 app = Flask(__name__)
 
 @app.get("/")
-def root(): return "ok"
+def root():
+    return "ok", 200
 
 @app.get("/signals")
 def get_signals():
-    if not CSV_PATH.exists(): return Response("", mimetype="text/csv")
+    if not CSV_PATH.exists():
+        return Response("", mimetype="text/csv")
     return Response(CSV_PATH.read_text("utf-8"), mimetype="text/csv")
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # /webhook?ping=1 のようなGETはDiscordへ通知せずにOKだけ返す
     if request.method == "GET" and request.args.get("ping"):
-        notify_from_tv({"ping": True})
+        print("[info] GET ping -> 応答のみ (Discord通知なし)")
         return jsonify({"ok": True, "ping": True})
 
     try:
         data = request.get_json(silent=True) or {}
     except Exception:
         data = {}
+
     append_csv_row(data)
     notify_from_tv(data)
     return jsonify({"ok": True})
