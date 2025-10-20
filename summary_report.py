@@ -1,33 +1,53 @@
-# summary_report.py — 全期間まとめ＆月次ハイライトをDiscordへ
+# summary_report.py — 全期間まとめ＆月次ハイライトをDiscordへ（JST基準）
 import os, csv
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-import requests
 from collections import defaultdict
+import requests
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 CSV_TRADES = Path("logs") / "trades.csv"
+
+# ===== 日本時間（JST, UTC+9）で集計・表示 =====
 JST = timezone(timedelta(hours=9))
 
-def parse_iso(s):
+def jst_now():
+    return datetime.now(timezone.utc).astimezone(JST)
+
+def parse_iso_jst(s: str):
+    """ISO8601 を JST の aware datetime へ。TZ なしは JST とみなす。epoch秒も可。"""
+    if not s:
+        return None
+    # epoch
     try:
-        return datetime.fromisoformat(s)
-    except:
+        if s.strip().isdigit() or (s.strip().replace('.','',1).isdigit() and s.count('.')<=1):
+            return datetime.fromtimestamp(float(s), tz=JST)
+    except Exception:
+        pass
+    # ISO8601
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JST)
+        return dt.astimezone(JST)
+    except Exception:
         return None
 
 def load_trades():
-    if not CSV_TRADES.exists(): return []
+    if not CSV_TRADES.exists():
+        return []
     rows = []
     with CSV_TRADES.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            t = parse_iso(row.get("close_ts") or "")
+            t = parse_iso_jst(row.get("close_ts") or "")
             if not t: continue
-            rows.append({
-                "close_ts": t.astimezone(JST),
-                "agent": (row.get("agent") or "fixed").lower(),
-                "symbol": (row.get("symbol") or "-").upper(),
-                "pnl_pct": float(row.get("pnl_pct") or 0.0),
-            })
+            agent = (row.get("agent") or "fixed").lower()
+            symbol = (row.get("symbol") or "-").upper()
+            try:
+                pnl = float(row.get("pnl_pct") or 0.0)
+            except Exception:
+                pnl = 0.0
+            rows.append({"close_ts": t, "agent": agent, "symbol": symbol, "pnl_pct": pnl})
     return rows
 
 def agg(rows):
@@ -48,17 +68,19 @@ def agg(rows):
 def monthly_highlight(rows):
     by_month=defaultdict(float)
     for r in rows:
-        key = r["close_ts"].strftime("%Y-%m")
+        key = r["close_ts"].strftime("%Y-%m")  # JSTの「年月」で集計
         by_month[key]+=r["pnl_pct"]
     return sorted(by_month.items(), key=lambda x:-x[1])[:2]
 
 def post_embed(title, desc, color=0x1abc9c):
     if not DISCORD_WEBHOOK:
         print("[warn] DISCORD_WEBHOOK not set"); return
+    now_jst_str = jst_now().strftime("%Y-%m-%d %H:%M JST")
     payload = {"embeds":[{
-        "title": title, "description": desc, "color": color,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":{"text":"AIりんご式 サマリーレポート"}
+        "title": f"{title}  ({now_jst_str})",
+        "description": desc,
+        "color": color,
+        "footer":{"text":"AIりんご式 サマリーレポート（JST）"}
     }]}
     r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
     print("discord:", r.status_code)
@@ -75,7 +97,7 @@ def main():
     tops = monthly_highlight(rows)
 
     lines = []
-    lines.append(f"期間: **{first} ～ {last}** (JST)")
+    lines.append(f"期間(JST): **{first} ～ {last}**")
     lines.append(f"総損益: **{total:+.2f}%** / 勝率 **{winrate:.1f}%** / PF **{pf:.2f}** / 件数 **{cnt}**")
     if top:
         lines.append("上位銘柄:")
