@@ -1,6 +1,6 @@
-# report_all.py — 1通で全部レポート（JST）
+# report_all.py — 1通で全部レポート（JST）+ 勝者自動切替（active_agent.txt 更新）
 # - 昨日のデイリー
-# - 直近7日/30日の fixed vs rt 比較
+# - 直近7日/30日の fixed vs rt 比較（勝者を active_agent.txt に書き込み）
 # - 全期間まとめ + 月次ハイライト
 #
 # 前提: logs/trades.csv（列例: close_ts, agent, symbol, pnl_pct）
@@ -13,6 +13,7 @@ import requests
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 CSV_TRADES = Path("logs") / "trades.csv"
+ACTIVE_AGENT_FILE = Path("active_agent.txt")  # server.py が参照して通知対象を切替
 
 JST = timezone(timedelta(hours=9))
 
@@ -103,6 +104,30 @@ def fmt_compare(label, lines):
         out.append(f"  {a:5}: {ssum:+.2f}% / 勝率 {wr:.1f}% / PF {pf:.2f} / 件数 {cnt}")
     return "\n".join(out)
 
+def pick_winner(lines_7d, lines_30d):
+    # lines: [(agent, sum, wr, pf, cnt), ...]
+    def best(lines):
+        if not lines:
+            return None
+        # 合計損益 → 勝率 → PF の優先で評価
+        return sorted(lines, key=lambda x: (x[1], x[2], x[3]))[-1][0]
+
+    b7  = best(lines_7d)
+    b30 = best(lines_30d)
+
+    # 両期間で一致→それを採用
+    if b7 and b30 and b7 == b30:
+        return b7
+    # 片方だけ決まっている→それを採用
+    if b7 and not b30:
+        return b7
+    if b30 and not b7:
+        return b30
+    # 両方出ていて食い違う→直近7日を優先
+    if b7 and b30 and b7 != b30:
+        return b7
+    return None
+
 # ---- (3) 全期間 + 月次 ----
 def agg_all(rows):
     total=0.0; wins=0; cnt=0
@@ -154,6 +179,16 @@ def main():
         fmt_compare("直近30日", last30)
     ])
 
+    # 勝者判定＆ active_agent.txt へ反映
+    winner = pick_winner(last7, last30)
+    winner_line = "🏁 総合判定：—（active_agentは変更しません）"
+    if winner in ("fixed", "rt"):
+        try:
+            ACTIVE_AGENT_FILE.write_text(winner + "\n", encoding="utf-8")
+            winner_line = f"🏁 総合判定：**{('固定' if winner=='fixed' else 'RT')}優勢**（通知対象を自動切替）"
+        except Exception as e:
+            winner_line = f"🏁 総合判定：{winner}（※ファイル更新失敗: {e}）"
+
     # (3) 全期間
     if rows:
         first = min(r["close_ts"] for r in rows).strftime("%Y-%m-%d")
@@ -162,16 +197,16 @@ def main():
         first = last = "-"
     a_total, a_wr, a_pf, a_cnt, top = agg_all(rows)
     tops = monthly_highlight(rows)
-    lines = [f"**全期間（{first} ～ {last}）**",
-             f"総損益: {a_total:+.2f}% / 勝率: {a_wr:.1f}% / PF: {a_pf:.2f} / 件数: {a_cnt}"]
+    line_list = [f"**全期間（{first} ～ {last}）**",
+                 f"総損益: {a_total:+.2f}% / 勝率: {a_wr:.1f}% / PF: {a_pf:.2f} / 件数: {a_cnt}"]
     if top:
-        lines.append("上位銘柄: " + ", ".join([f"{s}:{v:+.2f}%" for s,v in top]))
+        line_list.append("上位銘柄: " + ", ".join([f"{s}:{v:+.2f}%" for s,v in top]))
     if tops:
-        lines.append("月次ハイライト: " + ", ".join([f"{m}:{v:+.2f}%" for m,v in tops]))
-    all_block = "\n".join(lines)
+        line_list.append("月次ハイライト: " + ", ".join([f"{m}:{v:+.2f}%" for m,v in tops]))
+    all_block = "\n".join(line_list)
 
     title = f"📦 総合レポート（JST）  {now_str}"
-    desc = "\n\n".join([daily_block, comp_block, all_block])
+    desc = "\n\n".join([daily_block, comp_block, winner_line, all_block])
 
     ok = post_discord(title, desc, 0x5865F2)
     if not ok:
