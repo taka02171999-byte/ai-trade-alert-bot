@@ -1,4 +1,4 @@
-# compare_agents.py — 直近7日/30日の fixed vs rt をDiscordに比較レポート
+# compare_agents.py — 直近7日/30日の fixed vs rt をDiscordに比較レポート（JST基準）
 import os, csv
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -7,14 +7,28 @@ import requests
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 CSV_TRADES = Path("logs") / "trades.csv"
 
+# ===== すべて日本時間（JST, UTC+9）で集計・表示 =====
 JST = timezone(timedelta(hours=9))
 
 def jst_now():
     return datetime.now(timezone.utc).astimezone(JST)
 
-def parse_iso(s: str):
+def parse_iso_jst(s: str):
+    """ISO8601 を JST の aware datetime へ。TZ なしは JST とみなす。epoch秒も可。"""
+    if not s:
+        return None
+    # epoch seconds
     try:
-        return datetime.fromisoformat(s)
+        if s.strip().isdigit() or (s.strip().replace('.','',1).isdigit() and s.count('.')<=1):
+            return datetime.fromtimestamp(float(s), tz=JST)
+    except Exception:
+        pass
+    # ISO8601
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JST)
+        return dt.astimezone(JST)
     except Exception:
         return None
 
@@ -24,28 +38,27 @@ def load_trades():
         return rows
     with CSV_TRADES.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            close_ts = parse_iso(row.get("close_ts") or "")
+            close_ts = parse_iso_jst(row.get("close_ts") or "")
             if not close_ts:
                 continue
-            rows.append({
-                "close_ts": close_ts,
-                "agent": (row.get("agent") or "fixed").lower(),
-                "symbol": (row.get("symbol") or "-").upper(),
-                "pnl_pct": float(row.get("pnl_pct") or 0.0),
-            })
+            agent = (row.get("agent") or "fixed").lower()
+            symbol = (row.get("symbol") or "-").upper()
+            try:
+                pnl_pct = float(row.get("pnl_pct") or 0.0)
+            except Exception:
+                pnl_pct = 0.0
+            rows.append({"close_ts": close_ts, "agent": agent, "symbol": symbol, "pnl_pct": pnl_pct})
     return rows
 
 def slice_since(days, rows):
-    now = jst_now()
-    since = now - timedelta(days=days)
-    return [r for r in rows if r["close_ts"].astimezone(JST) >= since]
+    since = jst_now() - timedelta(days=days)
+    return [r for r in rows if r["close_ts"] >= since]
 
 def summarize(rows):
     by_agent = {}
     for r in rows:
         a = r["agent"]
-        by_agent.setdefault(a, {"sum":0.0, "wins":0, "losses":0, "cnt":0, "profit_sum":0.0, "loss_sum":0.0})
-        s = by_agent[a]
+        s = by_agent.setdefault(a, {"sum":0.0, "wins":0, "losses":0, "cnt":0, "profit_sum":0.0, "loss_sum":0.0})
         pnl = r["pnl_pct"]
         s["sum"] += pnl
         s["cnt"] += 1
@@ -58,9 +71,9 @@ def summarize(rows):
     lines = []
     for a in sorted(by_agent.keys()):
         s = by_agent[a]
-        winrate = (s["wins"]/s["cnt"]*100.0) if s["cnt"]>0 else 0.0
+        wr = (s["wins"]/s["cnt"]*100.0) if s["cnt"]>0 else 0.0
         pf = (s["profit_sum"]/s["loss_sum"]) if s["loss_sum"]>0 else (s["profit_sum"] if s["profit_sum"]>0 else 0.0)
-        lines.append((a, s["sum"], winrate, pf, s["cnt"]))
+        lines.append((a, s["sum"], wr, pf, s["cnt"]))
     return lines
 
 def pick_winner(lines_7d, lines_30d):
@@ -72,7 +85,7 @@ def pick_winner(lines_7d, lines_30d):
     b30 = best(lines_30d)
     if "rt" in (b7, b30):
         return "rt"
-    elif "fixed" in (b7, b30):
+    if "fixed" in (b7, b30):
         return "fixed"
     return b7 or b30 or "-"
 
@@ -89,12 +102,14 @@ def fmt_lines(label, lines):
 
 def post_embed(title, desc, color=0x1abc9c):
     if not DISCORD_WEBHOOK:
-        print("[warn] DISCORD_WEBHOOK not set")
-        return
+        print("[warn] DISCORD_WEBHOOK not set"); return
+    # Discordの timestamp はUTCになるため、本文にJST時刻を明記
+    now_jst_str = jst_now().strftime("%Y-%m-%d %H:%M JST")
     payload = {"embeds":[{
-        "title": title, "description": desc, "color": color,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":{"text":"AIりんご式 比較レポート"}
+        "title": f"{title}  ({now_jst_str})",
+        "description": desc,
+        "color": color,
+        "footer":{"text":"AIりんご式 比較レポート（JST）"}
     }]}
     r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
     print("discord:", r.status_code)
