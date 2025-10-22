@@ -1,96 +1,68 @@
-# server.py — Webhook受信→AI起動→Discord通知（診断付き）
-import os, time, json, socket
+# select_symbols.py — 出来高×ボラで上位選出→DB保存→Discordに今日の監視銘柄を投稿
+import os, sqlite3
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+import pandas as pd
+import yfinance as yf
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-from orchestrator import handle_tv_signal, healthcheck as orch_health
 
 load_dotenv()
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
-ALLOWED_WEBHOOK_TOKEN = os.getenv("ALLOWED_WEBHOOK_TOKEN", "your_shared_secret").strip()
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+SELECT_TOP_N = int(os.getenv("SELECT_TOP_N", "40"))
 
-app = FastAPI(title="AI-ringo Webhook", version="1.0")
+DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "state.db"
+UNIVERSE_TXT = DATA_DIR / "universe.txt"
 
-async def send_discord(text: str):
-    if not DISCORD_WEBHOOK: return
-    try:
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS selected(
+        symbol TEXT NOT NULL,
+        ymd TEXT NOT NULL,
+        PRIMARY KEY(symbol, ymd)
+    )""")
+    return conn
+
+def jst_ymd():
+    return (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d")
+
+def load_universe():
+    if UNIVERSE_TXT.exists():
+        return [s.strip() for s in UNIVERSE_TXT.read_text().splitlines() if s.strip()]
+    return ["7203.T","6758.T","9984.T","9432.T","7974.T","6954.T","8306.T","4502.T","6981.T","9101.T"]
+
+def rank_symbols(symbols):
+    rows=[]
+    for s in symbols:
+        try:
+            df = yf.download(s, period="1mo", interval="1d", progress=False)
+            if df.empty: continue
+            atr = (df["High"]-df["Low"]).rolling(14).mean().iloc[-1]
+            vol = df["Volume"].rolling(20).mean().iloc[-1]
+            close = df["Close"].iloc[-1]
+            if pd.isna(atr) or pd.isna(vol) or pd.isna(close): continue
+            atr_pct = (atr/close)*100.0
+            score = atr_pct*0.7 + (vol/1e6)*0.3
+            rows.append((s, score))
+        except Exception: pass
+    df = pd.DataFrame(rows, columns=["symbol","score"]).sort_values("score", ascending=False)
+    return df.head(SELECT_TOP_N)
+
+async def main():
+    syms = load_universe()
+    df = rank_symbols(syms)
+    ymd = jst_ymd()
+    with _db() as conn:
+        conn.execute("DELETE FROM selected WHERE ymd=?", (ymd,))
+        conn.executemany("REPLACE INTO selected(symbol, ymd) VALUES(?,?)", [(s, ymd) for s in df["symbol"]])
+        conn.commit()
+    if DISCORD_WEBHOOK:
+        msg = "🧮 今日の“選定銘柄” (Top {}):\n{}".format(
+            SELECT_TOP_N, "\n".join(f"- {s}" for s in df["symbol"].tolist()))
         async with httpx.AsyncClient(timeout=10) as cli:
-            await cli.post(DISCORD_WEBHOOK, json={"content": text})
-    except Exception as e:
-        print(f"[discord] send failed: {e}")
+            await cli.post(DISCORD_WEBHOOK, json={"content": msg})
 
-@app.get("/")
-async def root(): return {"ok": True, "service": "ai-ringo"}
-@app.head("/") async def head_root(): return {}
-
-@app.get("/health")
-async def health():
-    ok, detail = await orch_health()
-    return {"ok": ok, "detail": detail}
-@app.head("/health") async def head_health(): return {}
-
-@app.get("/webhook") async def webhook_get(): return {"ok": True, "msg": "ping-keepalive"}
-@app.head("/webhook") async def webhook_head(): return {}
-
-@app.get("/diag")
-async def diag():
-    token = ALLOWED_WEBHOOK_TOKEN or ""
-    return {
-        "ok": True,
-        "has_discord_webhook": bool(DISCORD_WEBHOOK),
-        "token_prefix": (token[:2] + "***") if token else None,
-        "server_hostname": socket.gethostname(),
-    }
-
-@app.get("/test/discord")
-async def test_discord():
-    await send_discord("✅ Discord連携テスト成功！")
-    return {"ok": True}
-
-@app.post("/webhook/echo")
-async def webhook_echo(req: Request):
-    try:
-        data = await req.json()
-    except Exception:
-        data = {"raw": (await req.body()).decode("utf-8", errors="ignore")}
-    await send_discord(f"🪞 ECHO: ```{json.dumps(data)[:1800]}```")
-    return {"ok": True}
-
-LAST_ALERT = {}
-@app.post("/webhook/tv")
-async def webhook_tv(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
-
-    if (data.get("secret") or "").strip() != ALLOWED_WEBHOOK_TOKEN:
-        await send_discord("🔒 認証失敗（secret不一致）")
-        return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
-
-    symbol = str(data.get("symbol", "UNKNOWN"))
-    direction = str(data.get("dir", "N/A")).upper()
-    price = data.get("price", "N/A")
-    ts = data.get("ts", 0)
-
-    await send_discord(f"📡 初動: {symbol} {direction} @ {price} (ts={ts})")
-
-    key, now = (symbol, direction), time.time()
-    if key in LAST_ALERT and now - LAST_ALERT[key] < 8:
-        return {"ok": True, "debounced": True}
-    LAST_ALERT[key] = now
-
-    try:
-        p_val = float(price) if isinstance(price, (int, float, str)) else None
-        t_val = int(ts) if ts else 0
-        await handle_tv_signal(symbol=symbol, direction=direction, price=p_val, ts=t_val)
-    except Exception as e:
-        await send_discord(f"⚠️ orchestrator error: {e}")
-
-    return {"ok": True}
-
-@app.get("/webhook/tv")
-async def webhook_tv_get(): return {"ok": True, "msg": "Webhook endpoint OK"}
-@app.head("/webhook/tv")
-async def webhook_tv_head(): return {}
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
