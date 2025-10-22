@@ -1,120 +1,73 @@
-# server.py (debug build)
-import os, time, asyncio, json
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-from dotenv import load_dotenv
+# server.py
+import os
 import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+import asyncio
 
-from orchestrator import handle_tv_signal, healthcheck as orch_health
-
+# ===== 基本設定 =====
 load_dotenv()
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")          # ← DiscordのURL
-ALLOWED_TOKEN   = os.getenv("ALLOWED_WEBHOOK_TOKEN")    # ← Pineのsecretと一致必須
-DEBUG           = os.getenv("DEBUG", "1") == "1"        # デフォルトON（デプロイ後消してOK）
 
-app = FastAPI(title="AI-ringo Webhook (debug)")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+ALLOWED_WEBHOOK_TOKEN = os.getenv("ALLOWED_WEBHOOK_TOKEN", "your_shared_secret")
 
-# ---- 共通Discord送信（エラー詳細をログに） ----
-async def discord(text: str):
-    if not DISCORD_WEBHOOK:
-        print("[WARN] DISCORD_WEBHOOK is empty; skip discord send")
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as cli:
-            r = await cli.post(DISCORD_WEBHOOK, json={"content": text})
-            print(f"[DBG] discord resp {r.status_code}")
-    except Exception as e:
-        print(f"[ERR] discord send failed: {e}")
+app = FastAPI(title="AIりんご式Trading Webhook", version="1.0")
 
-# ---- keepalive ----
+# ===== テスト用ルート =====
 @app.get("/")
-async def root(): return {"ok": True}
-@app.head("/"), app.head("/webhook"), app.head("/health")
-async def head_ok(): return {}
-@app.get("/webhook"), app.get("/webhook/ping")
-async def ping(): return {"ok": True, "msg": "pong"}
+async def root():
+    return {"ok": True, "msg": "AIりんご式TradingBot"}
 
-# ---- 可視化ヘルス：現在の設定を丸わかり（secretは一部マスク）----
+@app.head("/")
+async def head_root():
+    return {}
+
 @app.get("/diag")
 async def diag():
-    masked = (ALLOWED_TOKEN[:2] + "***") if ALLOWED_TOKEN else None
-    return {
-        "has_discord_webhook": bool(DISCORD_WEBHOOK),
-        "allowed_token_prefix": masked,
-        "debug_mode": DEBUG,
-    }
+    return {"ok": True, "detail": "Diagnostic endpoint OK"}
 
-@app.get("/health")
-async def health():
-    ok, detail = await orch_health()
-    return {"ok": ok, "detail": detail}
+@app.head("/diag")
+async def head_diag():
+    return {}
 
-# ---- TradingView payload ----
-class TVPayload(BaseModel):
-    secret: str
-    symbol: str
-    dir: str
-    price: float
-    ts: int
-
-# ---- 受信テスト用：手動pingでDiscordに必ず飛ぶ ----
 @app.get("/test/discord")
 async def test_discord():
-    await discord("✅ /test/discord OK")
-    return {"ok": True}
+    """Discord通知テスト"""
+    if not DISCORD_WEBHOOK:
+        return JSONResponse({"ok": False, "error": "DISCORD_WEBHOOK未設定"})
+    async with httpx.AsyncClient() as client:
+        await client.post(DISCORD_WEBHOOK, json={"content": "✅ Discord連携テスト成功！"})
+    return {"ok": True, "msg": "Discordへ送信しました"}
 
-# ---- 受信テスト用：何でも受け取り＆Discordへエコー（secret無視）----
-@app.post("/webhook/echo")
-async def webhook_echo(req: Request):
-    try:
-        data = await req.json()
-    except Exception:
-        data = {"raw": await req.body()}
-    print(f"[ECHO] got: {data}")
-    await discord(f"🪞 ECHO: {json.dumps(data)[:1800]}")
-    return {"ok": True}
-
-# ---- 本番：/webhook/tv ----
-LAST_ALERT = {}
+# ===== TradingView Webhook =====
 @app.post("/webhook/tv")
-async def webhook_tv(req: Request):
-    # ①受信ログ
+async def webhook_tv(request: Request):
     try:
-        raw = await req.body()
-        print(f"[TV] raw body: {raw[:300]}")
-        data = json.loads(raw or "{}")
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
+        data = await request.json()
+        token = data.get("secret")
+        if token != ALLOWED_WEBHOOK_TOKEN:
+            return JSONResponse({"ok": False, "error": "認証トークンが不正です"}, status_code=403)
 
-    # ②バリデーション
-    try:
-        p = TVPayload(**data)
+        symbol = data.get("symbol", "Unknown")
+        direction = data.get("dir", "N/A")
+        price = data.get("price", "N/A")
+        ts = data.get("ts", "N/A")
+
+        message = f"📈 **{symbol}**\n方向: {direction}\n価格: {price}\n時刻: {ts}"
+
+        async with httpx.AsyncClient() as client:
+            await client.post(DISCORD_WEBHOOK, json={"content": message})
+
+        return {"ok": True, "msg": "Discordへ送信完了", "symbol": symbol}
+
     except Exception as e:
-        print(f"[TV] bad payload: {e}")
-        raise HTTPException(400, f"Bad payload: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-    # ③secret照合
-    if p.secret != (ALLOWED_TOKEN or ""):
-        print(f"[TV] forbidden: got secret='{p.secret}', expected='{ALLOWED_TOKEN}'")
-        raise HTTPException(403, "Forbidden")
+@app.get("/webhook/tv")
+async def webhook_tv_get():
+    return {"ok": True, "msg": "Webhook endpoint OK"}
 
-    # ④Discordへ即通知（AI前）
-    await discord(f"📡 初動: {p.symbol} {p.dir} @ {p.price:.2f}")
-
-    # ⑤デバウンス
-    key, now = (p.symbol, p.dir), time.time()
-    if key in LAST_ALERT and now - LAST_ALERT[key] < 8:
-        print("[TV] debounced")
-        return {"ok": True, "debounced": True}
-    LAST_ALERT[key] = now
-
-    # ⑥BUY/SELL以外は無視（安全）
-    if p.dir not in ("BUY", "SELL"):
-        return {"ok": True, "ignored": p.dir}
-
-    # ⑦AI起動
-    try:
-        await handle_tv_signal(symbol=p.symbol, direction=p.dir, price=p.price, ts=p.ts)
-    except Exception as e:
-        print(f"[ERR] orchestrator failed: {e}")
-    return {"ok": True}
+@app.head("/webhook/tv")
+async def webhook_tv_head():
+    return {}
