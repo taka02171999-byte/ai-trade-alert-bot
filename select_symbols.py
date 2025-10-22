@@ -1,9 +1,10 @@
-# select_symbols.py — 翌日の「推奨銘柄リスト」を自動作成 + 名称先読みキャッシュ（JST）
+# select_symbols.py — 初日だけ予備リストで通知確認／翌日以降はAI自動選定
 import os, csv, json, math, statistics, re, urllib.request
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import requests
 
+# === 設定 ===
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 TOP_K = int(os.getenv("TOP_K", "20"))
 MIN_TRADES_30D = int(os.getenv("MIN_TRADES_30D", "3"))
@@ -14,7 +15,9 @@ OUT_JSON = Path("watchlist.json")
 SYMBOL_CACHE_FILE = Path("symbol_names.json")
 JST = timezone(timedelta(hours=9))
 
-def jst_now(): return datetime.now(timezone.utc).astimezone(JST)
+# === 時間系 ===
+def jst_now(): 
+    return datetime.now(timezone.utc).astimezone(JST)
 
 def parse_ts(s):
     if not s: return None
@@ -32,12 +35,17 @@ def to_f(x, default=None):
     try: return float(x)
     except: return default
 
+# === Discord送信 ===
 def post_discord(title, desc, color=0x00b894):
     if not DISCORD_WEBHOOK: return
     payload = {"embeds":[{"title":title,"description":desc,"color":color,
                           "footer":{"text":"AIりんご式 Watchlist | " + jst_now().strftime("%Y-%m-%d %H:%M JST")}}]}
-    requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+    try:
+        requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+    except Exception as e:
+        print(f"[warn] discord post failed: {e}")
 
+# === CSV読み込み ===
 def load_trades(days=30):
     rows=[]; since = jst_now() - timedelta(days=days)
     if not CSV_TRADES.exists(): return rows
@@ -68,6 +76,7 @@ def load_signals(days=20):
             })
     return rows
 
+# === スコア算出 ===
 def zscore(x, a, b):
     if a is None or b is None or a==b: return 0.0
     t = (x - a) / (b - a)
@@ -124,45 +133,35 @@ def score_symbols(trades30, signals20):
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
-def _load_symbol_cache():
-    if SYMBOL_CACHE_FILE.exists():
-        try: return json.loads(SYMBOL_CACHE_FILE.read_text(encoding="utf-8"))
-        except: return {}
-    return {}
+# === 予備リスト（初日用） ===
+def fallback_symbols():
+    return ["4568","7203","5016","8136","7011","7013","4568","6526","285A"]
 
-def _save_symbol_cache(cache: dict):
-    SYMBOL_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def prefetch_symbol_names(symbols):
-    cache = _load_symbol_cache(); updated = 0
-    for s in symbols:
-        if not s or not s.isdigit() or s in cache: continue
-        try:
-            url = f"https://finance.yahoo.co.jp/quote/{s}.T"
-            with urllib.request.urlopen(url, timeout=5) as res:
-                html = res.read().decode("utf-8", errors="ignore")
-            m = re.search(r"<title>([^（(]+)[（(]", html)
-            if m: cache[s] = m.group(1).strip(); updated += 1
-        except Exception as e:
-            print(f"[warn] prefetch {s}: {e}")
-    if updated: _save_symbol_cache(cache)
-    return updated
-
+# === メイン ===
 def main():
     tr = load_trades(days=30)
     sg = load_signals(days=20)
     ranked = score_symbols(tr, sg)
-    top = ranked[:TOP_K]
+    top = ranked[:TOP_K] if ranked else []
+
+    # 初日などデータが空のときはフォールバック
+    if not top:
+        syms = fallback_symbols()
+        desc = "🔰 初日モード：予備リストで通知テスト中\n" + "\n".join(f"・{s}" for s in syms)
+        post_discord("🧩 今日の暫定ウォッチリスト", desc)
+        OUT_TXT.write_text(",".join(syms) + "\n", encoding="utf-8")
+        OUT_JSON.write_text(json.dumps({"generated_at": jst_now().isoformat(),
+                                        "top_k": len(syms),
+                                        "symbols": syms}, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("[fallback list]", syms)
+        return 0
+
     syms = [r["symbol"] for r in top]
-
-    updated = prefetch_symbol_names(syms)
-    if updated: print(f"[prefetch] symbol names updated: {updated}")
-
+    lines = [f"・{r['symbol']}: score {r['score']:.3f} / pnl30 {r['pnl30']:+.2f}% / wr {r['wr30']:.1f}% / cnt {r['cnt30']}" for r in top[:10]] or ["候補なし（データ不足）"]
+    post_discord("🧩 翌日ウォッチリスト（自動選定）", "\n".join(lines))
     OUT_TXT.write_text(",".join(syms) + "\n", encoding="utf-8")
     OUT_JSON.write_text(json.dumps({"generated_at": jst_now().isoformat(),
                                     "top_k": TOP_K, "symbols": top}, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = [f"・{r['symbol']}: score {r['score']:.3f} / pnl30 {r['pnl30']:+.2f}% / wr {r['wr30']:.1f}% / cnt {r['cnt30']}" for r in top[:10]] or ["候補なし（データ不足）"]
-    post_discord("🧩 翌日ウォッチリスト（自動選定）", "\n".join(lines))
     print("[watchlist]", syms)
     return 0
 
