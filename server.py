@@ -1,6 +1,6 @@
-# server.py — Webhook 1本・fixed/rt 内部併走 + 勝者のみ通知 + 「厳選銘柄×採用AI」だけ通知 + 銘柄名表示（キャッシュ参照）
+# server.py — Webhook 1本・fixed/rt 内部併走 + 勝者/厳選のみ通知 + 銘柄名 + 事前フィルタ（出来高/ブレイク幅/クールダウン）
 # 依存: flask, requests
-import os, csv, json, uuid, requests, time, re
+import os, csv, json, uuid, requests, time, re, statistics
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, Response
@@ -10,7 +10,7 @@ from threading import Lock
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 AGENTS = [a.strip().lower() for a in os.getenv("AGENTS", "fixed,rt").split(",") if a.strip()]
 if not AGENTS: AGENTS = ["fixed"]
-DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "8"))           # 同一通知の連打抑制
+DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "8"))            # 同一通知の連打抑制
 MIN_HOLD_SEC = int(os.getenv("MIN_HOLD_SEC", "10"))           # 直後ヒゲ除外
 MIN_ABS_PNL_PCT = float(os.getenv("MIN_ABS_PNL_PCT", "0.02")) # ±0%ノイズ除外(%)
 BEST_AGENT_MODE = os.getenv("BEST_AGENT_MODE", "on").lower()  # "on": 勝者のみ通知
@@ -24,6 +24,7 @@ ACTIVE_AGENT_FILE = Path("active_agent.txt")      # 比較レポート等が更�
 NAME_CACHE = Path("symbol_names.json")            # 銘柄名キャッシュ(JSON)
 SELECTED_JSON = LOG_DIR / "selected_symbols.json" # 夜のレポが更新（翌日の厳選）
 OVERRIDES_JSON = Path("overrides_selected.json")  # 任意: 手動上書き
+PARAMS_JSON = Path("params.json")                 # 最適化パラメータ（学習で更新）
 
 # CSV初期化
 if not CSV_SIGNALS.exists():
@@ -40,6 +41,7 @@ if not CSV_TRADES.exists():
 csv_lock = Lock()
 LAST_SENT = {}
 ACTIVE_POS = {}
+_last_entry_time = {}  # {symbol: epoch}
 
 # ====== 共通関数 ======
 JST = timezone(timedelta(hours=9))
@@ -94,6 +96,50 @@ def get_symbol_name(sym: str):
 def label_with_name(sym: str):
     name = get_symbol_name(sym)
     return f"{sym} ({name})" if name else sym
+
+# --- パラメータロード & 事前フィルタ（出来高/ブレイク/クールダウン） ---
+def load_params():
+    try:
+        if PARAMS_JSON.exists():
+            return json.loads(PARAMS_JSON.read_text(encoding="utf-8"))
+    except: pass
+    return {}
+
+def recent_median_volume(symbol, limit=300):
+    # 直近N行から同銘柄の出来高メジアン
+    try:
+        vols=[]
+        with CSV_SIGNALS.open(newline="",encoding="utf-8") as f:
+            for r in list(csv.DictReader(f))[-limit:]:
+                if (r.get("symbol") or "").upper()==symbol:
+                    v = to_f(r.get("v"))
+                    if v and v>0: vols.append(v)
+        return statistics.median(vols) if vols else None
+    except: return None
+
+def pass_pre_filters(symbol, side, o,h,l,c,v, params):
+    p = params.get(symbol,{})
+    # 1) 出来高（相対メジアン）
+    if v and v>0:
+        med = recent_median_volume(symbol) or v
+        if med>0:
+            rel = v/med
+            if rel < float(p.get("min_vol_mult", 1.0)):
+                return False
+    # 2) ブレイク幅（バー内伸び率）
+    if o and o>0:
+        br = abs(c - o)/o
+        if br < float(p.get("min_break_pct", 0.0)):
+            return False
+    # 3) クールダウン
+    cd = int(p.get("cooldown_sec", 0))
+    if cd>0:
+        tnow = time.time()
+        last = _last_entry_time.get(symbol, 0)
+        if tnow - last < cd:
+            return False
+        _last_entry_time[symbol] = tnow
+    return True
 
 # ====== Discord ======
 def post_discord(title, desc, color):
@@ -150,6 +196,10 @@ def handle_event_for_agent(agent, data):
     side   = (data.get("side") or "").lower()
     tf     = data.get("tf") or data.get("timeframe") or "-"
     price  = to_f(data.get("c") or data.get("close"))
+    vol    = to_f(data.get("v"))
+    openp  = to_f(data.get("o"))
+    highp  = to_f(data.get("h"))
+    lowp   = to_f(data.get("l"))
 
     # 受信ログは常に残す
     log_signal_row(agent, data)
@@ -168,6 +218,12 @@ def handle_event_for_agent(agent, data):
     # 主要イベントはデバウンス
     if side in ("buy","sell","tp","sl") and not pass_debounce(agent, symbol, side):
         return
+
+    # ★ エントリー前 事前フィルタ（出来高/ブレイク幅/クールダウン）
+    if side in ("buy","sell"):
+        params = load_params()
+        if not pass_pre_filters(symbol, side, openp, highp, lowp, price, vol, params):
+            return
 
     # エントリー
     if side in ("buy","sell") and price is not None:
@@ -208,7 +264,7 @@ def handle_event_for_agent(agent, data):
 
         pnl_r = round(pnl_pct, 3)
         # 記録
-        log_trade_row(opened, jst_now_iso(), agent, symbol, pos_id, pos["side"] if pos else "-", entry, price, pnl_r, tf)
+        log_trade_row(opened, jst_now_iso(), agent, symbol, pos["side"] if pos else "-", pos_id, entry, price, pnl_r, tf)
 
         # 通知
         label = label_with_name(symbol)
@@ -224,7 +280,7 @@ def handle_event_for_agent(agent, data):
             ACTIVE_POS[agent].pop(symbol, None)
         return
 
-    # 任意通知
+    # 任意通知（必要なら）
     if side:
         ttl = "📈[固定] シグナル" if agent=="fixed" else "📈[RT] シグナル"
         label = label_with_name(symbol)
