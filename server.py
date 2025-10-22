@@ -4,70 +4,77 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-import asyncio
 
-# ===== 基本設定 =====
 load_dotenv()
-
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 ALLOWED_WEBHOOK_TOKEN = os.getenv("ALLOWED_WEBHOOK_TOKEN", "your_shared_secret")
 
-app = FastAPI(title="AIりんご式Trading Webhook", version="1.0")
+app = FastAPI(title="AI-ringo Webhook")
 
-# ===== テスト用ルート =====
+# ---------- 基本ヘルス ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "msg": "AIりんご式TradingBot"}
+    return {"ok": True, "service": "ai-ringo"}
 
 @app.head("/")
 async def head_root():
     return {}
 
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.head("/health")
+async def head_health():
+    return {}
+
+# ---------- keepalive（UptimeRobotなど） ----------
+@app.get("/webhook")
+async def webhook_get():
+    return {"ok": True, "msg": "ping-keepalive"}
+
+@app.head("/webhook")
+async def webhook_head():
+    return {}
+
+# ---------- 診断・テスト ----------
 @app.get("/diag")
 async def diag():
-    return {"ok": True, "detail": "Diagnostic endpoint OK"}
-
-@app.head("/diag")
-async def head_diag():
-    return {}
+    # secret は先頭だけマスク
+    token = ALLOWED_WEBHOOK_TOKEN or ""
+    return {
+        "has_discord_webhook": bool(DISCORD_WEBHOOK),
+        "token_prefix": (token[:2] + "***") if token else None,
+    }
 
 @app.get("/test/discord")
 async def test_discord():
-    """Discord通知テスト"""
     if not DISCORD_WEBHOOK:
-        return JSONResponse({"ok": False, "error": "DISCORD_WEBHOOK未設定"})
-    async with httpx.AsyncClient() as client:
-        await client.post(DISCORD_WEBHOOK, json={"content": "✅ Discord連携テスト成功！"})
-    return {"ok": True, "msg": "Discordへ送信しました"}
+        return JSONResponse({"ok": False, "error": "DISCORD_WEBHOOK is empty"}, status_code=500)
+    async with httpx.AsyncClient(timeout=10) as cli:
+        await cli.post(DISCORD_WEBHOOK, json={"content": "✅ /test/discord OK"})
+    return {"ok": True}
 
-# ===== TradingView Webhook =====
+# ---------- TradingView 受信 ----------
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
     try:
         data = await request.json()
-        token = data.get("secret")
-        if token != ALLOWED_WEBHOOK_TOKEN:
-            return JSONResponse({"ok": False, "error": "認証トークンが不正です"}, status_code=403)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
 
-        symbol = data.get("symbol", "Unknown")
-        direction = data.get("dir", "N/A")
-        price = data.get("price", "N/A")
-        ts = data.get("ts", "N/A")
+    if data.get("secret") != (ALLOWED_WEBHOOK_TOKEN or ""):
+        return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
 
-        message = f"📈 **{symbol}**\n方向: {direction}\n価格: {price}\n時刻: {ts}"
+    symbol = data.get("symbol", "UNKNOWN")
+    direction = data.get("dir", "N/A")
+    price = data.get("price", "N/A")
+    ts = data.get("ts", "N/A")
 
-        async with httpx.AsyncClient() as client:
-            await client.post(DISCORD_WEBHOOK, json={"content": message})
+    # まずDiscordに通知（切り分け用）
+    if DISCORD_WEBHOOK:
+        msg = f"📡 初動: {symbol} {direction} @ {price} (ts={ts})"
+        async with httpx.AsyncClient(timeout=10) as cli:
+            await cli.post(DISCORD_WEBHOOK, json={"content": msg})
 
-        return {"ok": True, "msg": "Discordへ送信完了", "symbol": symbol}
-
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-@app.get("/webhook/tv")
-async def webhook_tv_get():
-    return {"ok": True, "msg": "Webhook endpoint OK"}
-
-@app.head("/webhook/tv")
-async def webhook_tv_head():
-    return {}
+    return {"ok": True}
