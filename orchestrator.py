@@ -1,107 +1,104 @@
 # orchestrator.py
-import os, asyncio, sqlite3
-from pathlib import Path
-from dotenv import load_dotenv
+import os
+import time
 import httpx
+import pandas as pd
 import yfinance as yf
-
-from ai.trailing_ai import StateStore, TrailingAI
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 load_dotenv()
+
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.8"))
-SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.5"))
-NAMES_OVERRIDES = os.getenv("NAMES_OVERRIDES", "")  # 例: "7203.T=トヨタ自動車;6758.T=ソニーG"
 
-# 同じstate.dbを使う（存在しなければ自動作成）
-DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "state.db"
-
-_store = StateStore()
-
-# ---- 日本語銘柄名リゾルバ（自動取得＋キャッシュ） ---------------------------
-class NameResolver:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ticker_names(
-                    symbol TEXT PRIMARY KEY,
-                    name   TEXT NOT NULL
-                )
-            """)
-        # 環境変数の上書き設定（優先）
-        self.overrides = {}
-        if NAMES_OVERRIDES.strip():
-            for pair in NAMES_OVERRIDES.split(";"):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    self.overrides[k.strip()] = v.strip()
-
-    def get(self, symbol: str) -> str:
-        # 1) 手動上書きがあればそれを返す
-        if symbol in self.overrides:
-            return self.overrides[symbol]
-
-        # 2) DBキャッシュ
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT name FROM ticker_names WHERE symbol=?", (symbol,))
-            row = cur.fetchone()
-            if row:
-                return row[0]
-
-        # 3) yfinance から取得（shortName/longName）
-        name = symbol
-        try:
-            info = yf.Ticker(symbol).info or {}
-            name = info.get("shortName") or info.get("longName") or symbol
-            # ちょい整形：よくあるカッコ表記の簡易クリーニング
-            for s, r in [("(株)", ""), ("株式会社", ""), (" Co., Ltd.", ""), (" Holdings", ""), (" Group", "")]:
-                name = name.replace(s, r).strip()
-        except Exception:
-            name = symbol  # 失敗時はシンボル
-
-        # 4) DBに保存
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("REPLACE INTO ticker_names(symbol,name) VALUES(?,?)", (symbol, name))
-        except Exception:
-            pass
-        return name
-
-_name_resolver = NameResolver(DB_PATH)
-# -----------------------------------------------------------------------
-
-async def _discord(text: str):
-    if not DISCORD_WEBHOOK: return
-    async with httpx.AsyncClient(timeout=10) as cli:
-        await cli.post(DISCORD_WEBHOOK, json={"content": text})
-
-def _notify_sync(text: str):
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_discord(text))
-    except RuntimeError:
-        asyncio.run(_discord(text))
-
-async def handle_tv_signal(symbol: str, direction: str, price: float, ts: int):
-    # 日本語（または取得できた名称）を自動解決
-    jp_name = _name_resolver.get(symbol)
-    await _discord(f"📡 初動: {jp_name} ({symbol}) {direction} @ {price:.2f}")
-
-    ai = TrailingAI(
-        store=_store,
-        tp_pct=TP_PCT,
-        sl_pct=SL_PCT,
-        poll_secs=45,
-        max_minutes=20
-    )
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, ai.run_once, symbol, direction, price, ts, _notify_sync)
-
-async def healthcheck():
-    ok = True
+# ====== ユーティリティ ======
+async def send_discord(msg: str):
+    """Discord通知（非同期）"""
     if not DISCORD_WEBHOOK:
-        ok = False
-        return ok, "Missing DISCORD_WEBHOOK"
-    return ok, "ok"
+        print("[warn] DISCORD_WEBHOOK 未設定")
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(DISCORD_WEBHOOK, json={"content": msg})
+
+def fetch_yahoo(symbol: str, interval="1m", lookback_min=60):
+    """YahooFinanceから直近データを取得"""
+    try:
+        df = yf.download(
+            tickers=symbol,
+            period=f"{int(lookback_min/60)+1}h",
+            interval=interval,
+            progress=False,
+            prepost=True,
+        )
+        if df.empty:
+            return None
+        df = df.tail(lookback_min)
+        return df
+    except Exception as e:
+        print(f"[yahoo] error: {e}")
+        return None
+
+# ====== メイン処理 ======
+async def handle_tv_signal(symbol: str, direction: str, price: float, ts: int = 0):
+    """
+    TradingViewからの初動信号を受け、AI後追い監視を実行
+    """
+    print(f"[AI] 受信: {symbol} {direction} @ {price}")
+
+    # 監視時間・設定
+    start_time = time.time()
+    monitor_sec = 60 * 15  # 最大15分追跡
+    check_interval = 60    # 1分ごとに更新
+
+    # ATR・初期ライン設定
+    df = fetch_yahoo(symbol)
+    if df is None or len(df) < 5:
+        await send_discord(f"⚠️ {symbol} のデータ取得に失敗（YahooFinance）")
+        return
+
+    atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+    tp = price + atr * 1.7 if direction == "BUY" else price - atr * 1.7
+    sl = price - atr * 0.9 if direction == "BUY" else price + atr * 0.9
+
+    await send_discord(f"📊 {symbol} 追跡開始\n方向: {direction}\nTP: {tp:.2f} / SL: {sl:.2f}\nATR: {atr:.3f}")
+
+    # ====== 後追い監視ループ ======
+    while time.time() - start_time < monitor_sec:
+        time.sleep(3)  # 短いスリープで落ち着かせる
+        df_new = fetch_yahoo(symbol, lookback_min=3)
+        if df_new is None or df_new.empty:
+            continue
+
+        latest = df_new.iloc[-1]
+        high, low = latest["High"], latest["Low"]
+        now_price = latest["Close"]
+
+        # 利確／損切りチェック
+        if direction == "BUY":
+            if high >= tp:
+                await send_discord(f"🎯 利確達成: {symbol} @ {tp:.2f}")
+                return
+            elif low <= sl:
+                await send_discord(f"🛑 損切り発動: {symbol} @ {sl:.2f}")
+                return
+        else:  # SELL
+            if low <= tp:
+                await send_discord(f"🎯 利確達成: {symbol} @ {tp:.2f}")
+                return
+            elif high >= sl:
+                await send_discord(f"🛑 損切り発動: {symbol} @ {sl:.2f}")
+                return
+
+        # 経過ログ
+        if int((time.time() - start_time) // 60) % 3 == 0:
+            await send_discord(f"⏱ {symbol} 監視中... 現在価格: {now_price:.2f}")
+        time.sleep(check_interval)
+
+    await send_discord(f"⌛ {symbol} 監視終了（15分経過・決済なし）")
+
+# ====== 健康チェック ======
+async def healthcheck():
+    try:
+        return True, "orchestrator OK"
+    except Exception as e:
+        return False, str(e)
