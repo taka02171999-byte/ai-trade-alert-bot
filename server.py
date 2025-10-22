@@ -13,26 +13,43 @@ ALLOWED_WEBHOOK_TOKEN = os.getenv("ALLOWED_WEBHOOK_TOKEN", "your_shared_secret")
 app = FastAPI(title="AI-ringo Webhook", version="1.0")
 
 async def send_discord(text: str):
-    if not DISCORD_WEBHOOK: return
+    if not DISCORD_WEBHOOK:
+        return
     try:
         async with httpx.AsyncClient(timeout=10) as cli:
             await cli.post(DISCORD_WEBHOOK, json={"content": text})
     except Exception as e:
         print(f"[discord] send failed: {e}")
 
+# ---- root
 @app.get("/")
-async def root(): return {"ok": True, "service": "ai-ringo"}
-@app.head("/") async def head_root(): return {}
+async def root():
+    return {"ok": True, "service": "ai-ringo"}
 
+@app.head("/")
+async def head_root():
+    return {}
+
+# ---- health
 @app.get("/health")
 async def health():
     ok, detail = await orch_health()
     return {"ok": ok, "detail": detail}
-@app.head("/health") async def head_health(): return {}
 
-@app.get("/webhook") async def webhook_get(): return {"ok": True, "msg": "ping-keepalive"}
-@app.head("/webhook") async def webhook_head(): return {}
+@app.head("/health")
+async def head_health():
+    return {}
 
+# ---- keepalive
+@app.get("/webhook")
+async def webhook_get():
+    return {"ok": True, "msg": "ping-keepalive"}
+
+@app.head("/webhook")
+async def webhook_head():
+    return {}
+
+# ---- diag & test
 @app.get("/diag")
 async def diag():
     token = ALLOWED_WEBHOOK_TOKEN or ""
@@ -48,6 +65,7 @@ async def test_discord():
     await send_discord("✅ Discord連携テスト成功！")
     return {"ok": True}
 
+# ---- echo
 @app.post("/webhook/echo")
 async def webhook_echo(req: Request):
     try:
@@ -57,7 +75,9 @@ async def webhook_echo(req: Request):
     await send_discord(f"🪞 ECHO: ```{json.dumps(data)[:1800]}```")
     return {"ok": True}
 
+# ---- TradingView webhook
 LAST_ALERT = {}
+
 @app.post("/webhook/tv")
 async def webhook_tv(request: Request):
     try:
@@ -91,6 +111,9 @@ async def webhook_tv(request: Request):
     return {"ok": True}
 
 @app.get("/webhook/tv")
-async def webhook_tv_get(): return {"ok": True, "msg": "Webhook endpoint OK"}
+async def webhook_tv_get():
+    return {"ok": True, "msg": "Webhook endpoint OK"}
+
 @app.head("/webhook/tv")
-async def webhook_tv_head(): return {}
+async def webhook_tv_head():
+    return {}
