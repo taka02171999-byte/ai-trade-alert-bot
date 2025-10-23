@@ -11,4 +11,5 @@ Cython==3.0.11
 setuptools==75.1.0
 wheel==0.44.0
 pip==24.2
+peewee==3.17.6
 --only-binary=:all:
