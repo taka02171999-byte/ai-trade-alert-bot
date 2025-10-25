@@ -3,56 +3,46 @@ import json
 from datetime import datetime, timedelta
 
 TOP_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "10"))
+
 ORCH_STATE_PATH = "data/orchestrator_state.json"
 
 def _utc_now():
     return datetime.utcnow()
 
-def _utc_iso(dt=None):
-    if dt is None:
-        dt = _utc_now()
-    return dt.isoformat(timespec="seconds")
+def _now_iso():
+    return _utc_now().isoformat(timespec="seconds")
 
 def load_orch():
-    # orchestrator_state.json が無い or 壊れてる場合でも壊れず動くように
-    base = {
-        "active_symbols": [],  # 現在エントリー対象と考えていい銘柄
-        "cooldown": {}         # { "7203.T": "2025-10-26T06:30:00" }
-    }
     if not os.path.exists(ORCH_STATE_PATH):
-        return base
-    try:
-        with open(ORCH_STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "active_symbols" not in data:
-                data["active_symbols"] = []
-            if "cooldown" not in data:
-                data["cooldown"] = {}
-            return data
-    except:
-        return base
+        return {
+            "active_symbols": [],  # 今監視・採用OKな銘柄リスト
+            "cooldown": {}         # { "7203.T": "2025-10-25T10:00:00" }
+        }
+    with open(ORCH_STATE_PATH, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except:
+            return {
+                "active_symbols": [],
+                "cooldown": {}
+            }
 
 def save_orch(state):
     with open(ORCH_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 def is_cooldown(symbol, orch_state):
-    """
-    クールダウン中ならTrue
-    """
     cd = orch_state.get("cooldown", {})
     if symbol not in cd:
         return False
+    until_str = cd[symbol]
     try:
-        until_dt = datetime.fromisoformat(cd[symbol])
+        until_dt = datetime.fromisoformat(until_str)
     except:
         return False
     return _utc_now() < until_dt
 
 def put_cooldown(symbol, minutes=5):
-    """
-    クローズ直後に少し冷却時間を与える。
-    """
     orch_state = load_orch()
     orch_state.setdefault("cooldown", {})
     orch_state["cooldown"][symbol] = (_utc_now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
@@ -60,14 +50,12 @@ def put_cooldown(symbol, minutes=5):
 
 def refresh_top_symbols():
     """
-    active_symbolsをTOP_LIMIT以内に丸める。
-
-    本番イメージ：
-    - utils/ai_selector.pyで銘柄スコアを出す
-    - スコア上位をactive_symbolsに入れる
-    - あと勝率や出来高、ボラ、最近のヒット率で並べ替える
-
-    いまはシンプルに「既にactive_symbolsに入ってる順番を維持、頭からTOP_LIMITだけ有効」にしてる。
+    本番では:
+      - 勝率とか
+      - 流動性
+      - その日のヒット率
+    などからランキングして上位TOP_LIMITだけ残す。
+    今は単純に今のactive_symbolsを先頭からTOP_LIMITに切り詰めるだけ。
     """
     orch_state = load_orch()
     active = orch_state.get("active_symbols", [])
@@ -76,52 +64,42 @@ def refresh_top_symbols():
 
 def should_accept_signal(symbol, side):
     """
-    server.py からENTRY_BUY/ENTRY_SELL受信時に呼ばれる。
+    server.py から呼ばれる。
+    戻り値は4つ:
+      accept(bool),
+      reject_reason(str),
+      tp_target(float|None),
+      sl_target(float|None)
 
-    戻り値:
-      (True, "")  ならエントリー許可
-      (False, "理由") なら拒否してログに書く
+    tp_target / sl_target は Discord のエントリー通知にそのまま出す。
+    今はダミーで None にしてあるので、あとでロジックを差し込めばOK。
     """
     orch_state = load_orch()
-
-    # Top銘柄リストを一応整える
     refresh_top_symbols()
 
-    # クールダウン中は入らない
+    # クールダウン中は拒否
     if is_cooldown(symbol, orch_state):
-        return (False, "cooldown")
+        return False, "cooldown", None, None
 
-    # Top銘柄以外は入らない
+    # Top監視リスト外は拒否
     if symbol not in orch_state.get("active_symbols", []):
-        return (False, "not_in_top")
+        return False, "not_in_top", None, None
 
-    # ここで拡張：
-    # 例えばボラが高すぎる/低すぎる、出来高が薄すぎる等はあとでここで弾く。
-    # さらに「AI推奨ブレイクレンジ」(ai_selector側) と比較してもいい。
-    #
-    # 例:
-    #   if not ai_selector.is_good_break(symbol, side):
-    #       return (False, "ai_reject")
-    #
-    # 今はシンプルに許可。
-    return (True, "")
+    # --- ここが将来の"AIが決めた利確/損切り目安"
+    # 例: tp_target = entry_price * 1.012 みたいなやつを計算して返す想定。
+    # 今はまだentry_priceわからないので None にしておく。
+    tp_target = None
+    sl_target = None
+
+    return True, "", tp_target, sl_target
 
 def mark_symbol_active(symbol):
-    """
-    採用した銘柄をactive_symbolsの先頭に押し上げる。
-    これで「いま注目してる銘柄ほど優先度高い」状態になる。
-    """
     orch_state = load_orch()
-    active_list = orch_state.get("active_symbols", [])
-    if symbol in active_list:
-        # 既にあるなら一旦消して先頭に入れ直す
-        active_list.remove(symbol)
-    active_list.insert(0, symbol)
-    orch_state["active_symbols"] = active_list[:TOP_LIMIT]
+    if symbol not in orch_state["active_symbols"]:
+        # 先頭に入れて優先度を上げるイメージ
+        orch_state["active_symbols"].insert(0, symbol)
     save_orch(orch_state)
 
 def mark_symbol_closed(symbol):
-    """
-    ポジ手仕舞いした銘柄にクールダウンを入れる。
-    """
+    # クローズ後はクールダウン入れる
     put_cooldown(symbol, minutes=5)
