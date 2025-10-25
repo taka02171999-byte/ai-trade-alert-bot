@@ -1,195 +1,127 @@
-# orchestrator.py
-import os, time, json
-from pathlib import Path
-from datetime import datetime, timezone, timedelta, date
+import os
+import json
+from datetime import datetime, timedelta
 
-import numpy as np
-import pandas as pd
-import yfinance as yf
+TOP_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "10"))
+ORCH_STATE_PATH = "data/orchestrator_state.json"
 
-JST = timezone(timedelta(hours=9))
+def _utc_now():
+    return datetime.utcnow()
 
-# ---- ENV ----
-YF_RETRY       = int(os.getenv("YF_RETRY", "3"))
-YF_RETRY_WAIT  = float(os.getenv("YF_RETRY_WAIT", "1.2"))
-YF_BATCH_SIZE  = int(os.getenv("YF_BATCH_SIZE", "12"))
-YF_CACHE_SEC   = int(os.getenv("YF_CACHE_SEC", "60"))
+def _utc_iso(dt=None):
+    if dt is None:
+        dt = _utc_now()
+    return dt.isoformat(timespec="seconds")
 
-CONFIRM_EPS_PCT = float(os.getenv("CONFIRM_EPS_PCT", "0.3"))  # %
-
-TPSL_WINDOW_MIN = int(os.getenv("TPSL_WINDOW_MIN", "30"))
-MONITOR_SEC     = int(os.getenv("MONITOR_SEC", "30"))
-
-TP_FALLBACK_PCT = float(os.getenv("TP_FALLBACK_PCT", "0.6"))
-SL_FALLBACK_PCT = float(os.getenv("SL_FALLBACK_PCT", "0.35"))
-
-NOTIFY_ONLY_TOP10 = (os.getenv("NOTIFY_ONLY_TOP10", "true").lower() == "true")
-
-DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_FILE = DATA_DIR / "yf_cache.json"
-TOP10_FILE = DATA_DIR / "top10.json"
-UNIVERSE_FILE = DATA_DIR / "universe.txt"
-NAMES_FILE = DATA_DIR / "names.json"
-
-# ---- cache in file ----
-def _load_json(path: Path, default):
+def load_orch():
+    # orchestrator_state.json が無い or 壊れてる場合でも壊れず動くように
+    base = {
+        "active_symbols": [],  # 現在エントリー対象と考えていい銘柄
+        "cooldown": {}         # { "7203.T": "2025-10-26T06:30:00" }
+    }
+    if not os.path.exists(ORCH_STATE_PATH):
+        return base
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+        with open(ORCH_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "active_symbols" not in data:
+                data["active_symbols"] = []
+            if "cooldown" not in data:
+                data["cooldown"] = {}
+            return data
+    except:
+        return base
 
-_mem = _load_json(CACHE_FILE, {})
-_names = _load_json(NAMES_FILE, {})
+def save_orch(state):
+    with open(ORCH_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-def now_jst() -> datetime:
-    return datetime.now(timezone.utc).astimezone(JST)
-
-def today_str() -> str:
-    return now_jst().strftime("%Y-%m-%d")
-
-def to_yf_symbol(s: str) -> str:
-    s = (s or "").strip().upper()
-    if s.endswith(".T"): return s
-    # 285A/4568など
-    if s.replace("A","").isdigit() or (len(s) > 1 and s[:-1].isdigit() and s[-1] == "A"):
-        return s + ".T"
-    return s
-
-def _cache_get(sym: str):
-    o = _mem.get(sym)
-    if not o: return None
-    if time.time() - o["ts"] <= YF_CACHE_SEC:
-        return o["close"]
-    return None
-
-def _cache_put(sym: str, close: float):
-    _mem[sym] = {"ts": time.time(), "close": float(close)}
+def is_cooldown(symbol, orch_state):
+    """
+    クールダウン中ならTrue
+    """
+    cd = orch_state.get("cooldown", {})
+    if symbol not in cd:
+        return False
     try:
-        CACHE_FILE.write_text(json.dumps(_mem), encoding="utf-8")
-    except Exception:
-        pass
+        until_dt = datetime.fromisoformat(cd[symbol])
+    except:
+        return False
+    return _utc_now() < until_dt
 
-def fetch_last_close_bulk(symbols: list[str]) -> dict[str, float | None]:
-    """yfinanceをバッチ+リトライ+キャッシュで。失敗はNoneで返す。"""
-    out, need = {}, []
-    for raw in symbols:
-        yfs = to_yf_symbol(raw)
-        v = _cache_get(yfs)
-        if v is not None:
-            out[raw] = v
-        else:
-            need.append((raw, yfs))
-    if not need:
-        return out
+def put_cooldown(symbol, minutes=5):
+    """
+    クローズ直後に少し冷却時間を与える。
+    """
+    orch_state = load_orch()
+    orch_state.setdefault("cooldown", {})
+    orch_state["cooldown"][symbol] = (_utc_now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    save_orch(orch_state)
 
-    for i in range(0, len(need), YF_BATCH_SIZE):
-        batch = need[i:i+YF_BATCH_SIZE]
-        yf_syms = [b[1] for b in batch]
-        wait = YF_RETRY_WAIT
-        for tr in range(YF_RETRY):
-            try:
-                df = yf.download(
-                    yf_syms, period="1d", interval="1m",
-                    progress=False, auto_adjust=True, threads=False
-                )
-                if df is None or (hasattr(df, "empty") and df.empty):
-                    raise RuntimeError("empty df")
+def refresh_top_symbols():
+    """
+    active_symbolsをTOP_LIMIT以内に丸める。
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    closes = df["Close"].iloc[-1].to_dict()
-                else:
-                    closes = {yf_syms[0]: float(df["Close"].iloc[-1])}
+    本番イメージ：
+    - utils/ai_selector.pyで銘柄スコアを出す
+    - スコア上位をactive_symbolsに入れる
+    - あと勝率や出来高、ボラ、最近のヒット率で並べ替える
 
-                for raw, yfs in batch:
-                    v = closes.get(yfs)
-                    if v is None or (isinstance(v, float) and np.isnan(v)):
-                        out.setdefault(raw, None)
-                    else:
-                        out[raw] = float(v)
-                        _cache_put(yfs, float(v))
-                break
-            except Exception:
-                time.sleep(wait)
-                wait *= 1.8
-                if tr == YF_RETRY - 1:
-                    for raw, _ in batch:
-                        out.setdefault(raw, None)
+    いまはシンプルに「既にactive_symbolsに入ってる順番を維持、頭からTOP_LIMITだけ有効」にしてる。
+    """
+    orch_state = load_orch()
+    active = orch_state.get("active_symbols", [])
+    orch_state["active_symbols"] = active[:TOP_LIMIT]
+    save_orch(orch_state)
 
-    return out
+def should_accept_signal(symbol, side):
+    """
+    server.py からENTRY_BUY/ENTRY_SELL受信時に呼ばれる。
 
-def is_entry_confirmed(trigger_price: float, live_price: float, eps_pct: float | None = None) -> bool:
-    if live_price is None or trigger_price <= 0: return False
-    eps = (eps_pct if eps_pct is not None else CONFIRM_EPS_PCT) / 100.0
-    return abs(live_price - trigger_price) / trigger_price <= eps
+    戻り値:
+      (True, "")  ならエントリー許可
+      (False, "理由") なら拒否してログに書く
+    """
+    orch_state = load_orch()
 
-def atr_based_tp_sl(symbol: str, entry_price: float) -> tuple[float, float]:
-    """ATR20ベース。失敗時は%フォールバック。"""
-    try:
-        yfs = to_yf_symbol(symbol)
-        df = yf.download(yfs, period="5d", interval="1m", progress=False, auto_adjust=True, threads=False)
-        if df is None or df.empty:
-            df = yf.download(yfs, period="14d", interval="5m", progress=False, auto_adjust=True, threads=False)
-        if df is None or df.empty:
-            raise RuntimeError("no df")
+    # Top銘柄リストを一応整える
+    refresh_top_symbols()
 
-        high = df["High"].astype(float)
-        low  = df["Low"].astype(float)
-        close = df["Close"].astype(float)
-        prev = close.shift(1)
-        tr = pd.concat([(high-low).abs(), (high-prev).abs(), (low-prev).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(20).mean().iloc[-1]
-        if atr is None or np.isnan(atr) or atr <= 0:
-            raise RuntimeError("atr nan")
+    # クールダウン中は入らない
+    if is_cooldown(symbol, orch_state):
+        return (False, "cooldown")
 
-        tp = entry_price + atr * 1.1
-        sl = entry_price - atr * 0.7
-        return (float(tp), float(sl))
-    except Exception:
-        tp = entry_price * (1.0 + TP_FALLBACK_PCT/100.0)
-        sl = entry_price * (1.0 - SL_FALLBACK_PCT/100.0)
-        return (float(tp), float(sl))
+    # Top銘柄以外は入らない
+    if symbol not in orch_state.get("active_symbols", []):
+        return (False, "not_in_top")
 
-def load_universe() -> list[str]:
-    if UNIVERSE_FILE.exists():
-        syms = [s.strip() for s in UNIVERSE_FILE.read_text(encoding="utf-8").splitlines() if s.strip()]
-        return list(dict.fromkeys(syms))  # uniq保持
-    return []
+    # ここで拡張：
+    # 例えばボラが高すぎる/低すぎる、出来高が薄すぎる等はあとでここで弾く。
+    # さらに「AI推奨ブレイクレンジ」(ai_selector側) と比較してもいい。
+    #
+    # 例:
+    #   if not ai_selector.is_good_break(symbol, side):
+    #       return (False, "ai_reject")
+    #
+    # 今はシンプルに許可。
+    return (True, "")
 
-def load_today_top10() -> list[str]:
-    """当日の選定10銘柄を返す。無ければ universe の先頭10をフォールバック。"""
-    try:
-        d = _load_json(TOP10_FILE, {})
-        if d.get("date") == today_str() and isinstance(d.get("symbols"), list):
-            syms = [str(s).strip().upper() for s in d["symbols"] if str(s).strip()]
-            if syms: return syms[:10]
-    except Exception:
-        pass
-    uni = load_universe()
-    return uni[:10] if len(uni) >= 10 else uni
+def mark_symbol_active(symbol):
+    """
+    採用した銘柄をactive_symbolsの先頭に押し上げる。
+    これで「いま注目してる銘柄ほど優先度高い」状態になる。
+    """
+    orch_state = load_orch()
+    active_list = orch_state.get("active_symbols", [])
+    if symbol in active_list:
+        # 既にあるなら一旦消して先頭に入れ直す
+        active_list.remove(symbol)
+    active_list.insert(0, symbol)
+    orch_state["active_symbols"] = active_list[:TOP_LIMIT]
+    save_orch(orch_state)
 
-def is_in_today_top10(symbol: str) -> bool:
-    if not NOTIFY_ONLY_TOP10:
-        return True
-    top10 = load_today_top10()
-    return symbol.upper() in set([s.upper() for s in top10])
-
-def get_display_name(symbol: str) -> str:
-    """銘柄名の自動付与（キャッシュ）。失敗したらシンボルを返すだけ。"""
-    sym = symbol.upper()
-    if sym in _names: return _names[sym]
-    try:
-        yfs = to_yf_symbol(sym)
-        t = yf.Ticker(yfs)
-        name = (t.fast_info.get("shortName")
-                if hasattr(t, "fast_info") and isinstance(t.fast_info, dict)
-                else None)
-        if not name:
-            info = t.info or {}
-            name = info.get("shortName") or info.get("longName")
-        if name:
-            _names[sym] = str(name)
-            NAMES_FILE.write_text(json.dumps(_names, ensure_ascii=False), encoding="utf-8")
-            return _names[sym]
-    except Exception:
-        pass
-    return sym
+def mark_symbol_closed(symbol):
+    """
+    ポジ手仕舞いした銘柄にクールダウンを入れる。
+    """
+    put_cooldown(symbol, minutes=5)
