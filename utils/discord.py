@@ -1,16 +1,16 @@
 import requests
 import json
 
-def send_discord(webhook_url: str, content: str):
-    """Discord通知を送る"""
+def send_discord(webhook_url: str, text: str):
     if not webhook_url:
-        print("[Discord MOCK]\n" + content)
+        print("[Discord MOCK]", text)
         return
 
     headers = {"Content-Type": "application/json"}
-    payload = {"content": content}
+    payload = {"content": text}
+
     try:
         requests.post(webhook_url, headers=headers, data=json.dumps(payload), timeout=5)
     except Exception as e:
-        print(f"[Discord ERROR] {e}")
-        print("FAILED CONTENT:\n", content)
+        print("[Discord ERROR]", e)
+        print("FAILED CONTENT >>>", text)
