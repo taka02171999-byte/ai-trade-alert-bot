@@ -1,338 +1,105 @@
-import os
-import json
-import csv
-from datetime import datetime
+# server.py
+# ========================================
+# AIりんご式 Entry+Follow サーバー（vFINAL_ONECHANCE対応）
+# TradingView → Flask(Webhook) → Discord 通知
+# ========================================
+
 from flask import Flask, request, jsonify
+from datetime import datetime, timedelta, timezone
+import json
+import requests
+import os
 
-from utils.discord import send_discord
-from utils.time_utils import is_market_closed_now_jst, get_jst_now_str
-from orchestrator import should_accept_signal, mark_symbol_active, mark_symbol_closed
-
-# ------------------------------------------------------------
-# パス / 環境変数
-# ------------------------------------------------------------
-DATA_DIR = "data"
-STATE_PATH = os.path.join(DATA_DIR, "positions_state.json")
-TRADE_LOG = os.path.join(DATA_DIR, "trade_log.csv")
-REJECT_LOG = os.path.join(DATA_DIR, "rejected_signals.csv")
-SYMBOL_NAME_PATH = os.path.join(DATA_DIR, "symbol_names.json")
-
-DISCORD_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
-TV_SECRET = os.getenv("TV_SHARED_SECRET", "")
-MARKET_CLOSE_HHMM = os.getenv("MARKET_CLOSE_HHMM", "15:25")
+JST = timezone(timedelta(hours=9))
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
+SECRET_TOKEN = "super_secret_token_please_match"
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------
-# ユーティリティ: ファイル/状態
-# ------------------------------------------------------------
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
+# ==========================
+# 辞書（銘柄コード→日本語名）
+# ==========================
+with open("data/symbol_names.json", "r", encoding="utf-8") as f:
+    SYMBOL_NAMES = json.load(f)
 
-def load_json_safe(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except:
-            return default
+# ==========================
+# 共通関数
+# ==========================
+def jst_now_str():
+    return datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
-def load_state():
-    return load_json_safe(STATE_PATH, {})
-
-def save_state(state: dict):
-    ensure_data_dir()
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def append_csv(path, row_dict, fieldnames):
-    ensure_data_dir()
-    file_exists = os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row_dict)
-
-# ------------------------------------------------------------
-# 日本語銘柄名マップ
-# ------------------------------------------------------------
-def load_symbol_names():
-    return load_json_safe(SYMBOL_NAME_PATH, {})
-
-symbol_name_map = load_symbol_names()
-
-def pretty_symbol(symbol: str) -> str:
-    """
-    "7203.T" -> "トヨタ自動車（7203.T）"
-    マップに無いならそのまま "7203.T"
-    """
-    jp = symbol_name_map.get(symbol)
-    if jp:
-        return f"{jp}（{symbol}）"
-    return symbol
-
-# ------------------------------------------------------------
-# ポジション管理
-# ------------------------------------------------------------
-def is_in_position(state: dict, symbol: str) -> bool:
-    return symbol in state and state[symbol].get("open", False)
-
-def open_position(state: dict, symbol: str, side: str, entry_price: float):
-    state[symbol] = {
-        "open": True,
-        "side": side,  # "BUY" or "SELL"
-        "entry_price": float(entry_price),
-        "entry_time": get_jst_now_str()
+def discord_send(message, color=0x00ffcc):
+    """DiscordにEmbed送信"""
+    if not DISCORD_WEBHOOK:
+        print("⚠ Discord Webhook URL未設定")
+        return
+    data = {
+        "embeds": [
+            {
+                "title": "AIりんご式トレード通知",
+                "description": message,
+                "color": color,
+                "footer": {"text": "AIりんご式 | " + jst_now_str()}
+            }
+        ]
     }
+    requests.post(DISCORD_WEBHOOK, json=data)
 
-def close_position(state: dict, symbol: str, exit_price: float, reason: str):
-    """
-    reason: "TP", "SL", "TIMEOUT", "EOD"
-    """
-    if symbol not in state or not state[symbol].get("open", False):
-        return None
-
-    side = state[symbol]["side"]
-    entry_price = float(state[symbol]["entry_price"])
-
-    # PnLはシンプルにエントリーとの差（BUYなら上がれば+, SELLなら下がれば+）
-    pnl_val = exit_price - entry_price if side == "BUY" else entry_price - exit_price
-
-    trade_row = {
-        "timestamp": get_jst_now_str(),
-        "symbol": symbol,
-        "side": side,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
-        "reason": reason,
-        "pnl": pnl_val
-    }
-
-    append_csv(
-        TRADE_LOG,
-        trade_row,
-        ["timestamp", "symbol", "side", "entry_price", "exit_price", "reason", "pnl"]
-    )
-
-    # state更新
-    state[symbol]["open"] = False
-    state[symbol]["exit_price"] = exit_price
-    state[symbol]["close_time"] = get_jst_now_str()
-    state[symbol]["close_reason"] = reason
-    save_state(state)
-
-    # orchestrator側にも「閉じたよ」と伝える
-    mark_symbol_closed(symbol)
-
-    return trade_row
-
-def pct_change(entry_price: float, now_price: float, side: str) -> float:
-    """
-    エントリーからの%変化
-    SELLは逆向きに符号反転して「自分に有利ならプラス」にそろえる
-    """
-    entry_price = float(entry_price)
-    now_price = float(now_price)
-    raw_pct = (now_price - entry_price) / entry_price * 100.0
-    if side == "SELL":
-        raw_pct = -raw_pct
-    return raw_pct
-
-# ------------------------------------------------------------
-# Discordメッセージ生成
-# ------------------------------------------------------------
-def msg_entry(symbol: str, side: str, entry_price: float, tp_target, sl_target) -> str:
-    """
-    エントリー通知用
-    tp_target / sl_target は orchestrator からもらった価格。Noneなら非表示。
-    """
-    sym_txt = pretty_symbol(symbol)
-    icon = "🟢" if side == "BUY" else "🔴"
-    side_jp = "買いエントリー" if side == "BUY" else "売りエントリー"
-
-    lines = [
-        f"{icon} {sym_txt} {side_jp}",
-        f"IN価格: {entry_price}"
-    ]
-
-    if tp_target is not None:
-        lines.append(f"利確目安: {tp_target}")
-    if sl_target is not None:
-        lines.append(f"損切り目安: {sl_target}")
-
-    return "\n".join(lines)
-
-def msg_close(symbol: str, side: str, now_price: float, pct_val: float, reason: str) -> str:
-    """
-    クローズ通知用
-    """
-    sym_txt = pretty_symbol(symbol)
-
-    icons = {
-        "TP": "🎯",        # 利確
-        "SL": "⚡",        # 損切り
-        "TIMEOUT": "⏱",   # タイムアウト終了
-        "EOD": "🔔"       # 引け強制クローズ
-    }
-    labels = {
-        "TP": "利確",
-        "SL": "損切り",
-        "TIMEOUT": "タイムアウト終了",
-        "EOD": "引けクローズ(15:25)"
-    }
-
-    icon = icons.get(reason, "🔔")
-    label = labels.get(reason, reason)
-    side_jp = "買い" if side == "BUY" else "売り"
-
-    return (
-        f"{icon} {sym_txt} {label}\n"
-        f"方向: {side_jp}\n"
-        f"決済価格: {now_price}\n"
-        f"変化率: {pct_val:.2f}%"
-    )
-
-# ------------------------------------------------------------
-# GET /webhook (疎通確認用)
-# ------------------------------------------------------------
-@app.route("/webhook", methods=["GET"])
-def webhook_ping():
-    return jsonify({
-        "status": "ready",
-        "message": "POST /webhook でTradingViewシグナル受付中",
-        "time": get_jst_now_str()
-    }), 200
-
-# ------------------------------------------------------------
-# POST /webhook (本番)
-# ------------------------------------------------------------
+# ==========================
+# Webhook受信ルート
+# ==========================
 @app.route("/webhook", methods=["POST"])
-def webhook_post():
-    """
-    TradingView からの想定payload:
-    {
-      "secret": "...",
-      "type": "ENTRY_BUY" | "ENTRY_SELL" |
-               "PRICE_TICK" | "STEP_UP" | "STEP_DOWN" |
-               "TP" | "SL" | "TIMEOUT",
-      "symbol": "7203.T",
-      "price": 1234.5,
-      "step_label": "+1.0%"
-    }
-    """
-    payload = request.get_json(silent=True) or {}
+def webhook():
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "reason": "no data"}), 400
 
-    # セキュリティ
-    if payload.get("secret") != TV_SECRET:
-        return jsonify({"status": "forbidden"}), 403
+    if data.get("secret") != SECRET_TOKEN:
+        return jsonify({"status": "error", "reason": "invalid secret"}), 403
 
-    signal_type = payload.get("type", "")
-    symbol = payload.get("symbol", "")
-    now_price = float(payload.get("price", 0))
-    # step_label = payload.get("step_label", "")  # 今はDiscord投げないので未使用
+    event_type = data.get("type", "")
+    symbol = data.get("symbol", "")
+    price = data.get("price", None)
+    pct = data.get("pct_from_entry", None)
+    side = data.get("side", "")
+    step_label = data.get("step_label", "")
 
-    state = load_state()
+    name = SYMBOL_NAMES.get(symbol, symbol)
+    jst_time = jst_now_str()
 
-    # まず「市場クローズ後 (=15:25以降)」は強制EODで閉じる
-    if is_market_closed_now_jst(MARKET_CLOSE_HHMM):
-        if is_in_position(state, symbol):
-            side = state[symbol]["side"]
-            entry_price = float(state[symbol]["entry_price"])
-            pctv = pct_change(entry_price, now_price, side)
+    # === ENTRY系 ===
+    if event_type in ["ENTRY_BUY", "ENTRY_SELL"]:
+        emoji = "🟢" if event_type == "ENTRY_BUY" else "🔴"
+        msg = f"{emoji}【エントリー】\n銘柄: {symbol} {name}\n方向: {'買い' if side == 'BUY' else '売り'}\n価格: {price}円\n時刻: {jst_time}"
+        discord_send(msg, 0x00ff00 if side == "BUY" else 0xff3333)
 
-            close_position(state, symbol, now_price, "EOD")
-            if DISCORD_MAIN:
-                send_discord(DISCORD_MAIN, msg_close(symbol, side, now_price, pctv, "EOD"))
+    # === PRICE_TICK（AI判断用） ===
+    elif event_type == "PRICE_TICK":
+        print(f"📊 PRICE_TICK {symbol}: {price}, pct={pct}")
 
-        return jsonify({"status": "after_close"}), 200
+    # === STEP_UP / STEP_DOWN ===
+    elif event_type in ["STEP_UP", "STEP_DOWN"]:
+        # 今回はSTEP通知をスキップ（送らない）
+        pass
 
-    # -------------------------
-    # ENTRY: 新規エントリー
-    # -------------------------
-    if signal_type in ["ENTRY_BUY", "ENTRY_SELL"]:
-        side = "BUY" if signal_type == "ENTRY_BUY" else "SELL"
+    # === TP / SL / TIMEOUT ===
+    elif event_type in ["TP", "SL", "TIMEOUT"]:
+        emoji = "🎯" if event_type == "TP" else "⚡" if event_type == "SL" else "⏱"
+        title = "利確" if event_type == "TP" else "損切り" if event_type == "SL" else "タイムアウト"
+        msg = (
+            f"{emoji}【{title}】\n"
+            f"銘柄: {symbol} {name}\n"
+            f"決済価格: {price}円\n"
+            f"変化率: {pct if pct is not None else '---'}%\n"
+            f"AI判定により自動決済\n"
+            f"時刻: {jst_time}"
+        )
+        discord_send(msg, 0x33ccff if event_type == "TP" else 0xff6666 if event_type == "SL" else 0xcccc00)
 
-        # AI判定:
-        # accept: bool
-        # reject_reason: str
-        # tp_target: float or None
-        # sl_target: float or None
-        accept, reject_reason, tp_target, sl_target = should_accept_signal(symbol, side)
+    return jsonify({"status": "ok"})
 
-        if not accept:
-            append_csv(
-                REJECT_LOG,
-                {
-                    "timestamp": get_jst_now_str(),
-                    "symbol": symbol,
-                    "side": side,
-                    "reason": reject_reason
-                },
-                ["timestamp", "symbol", "side", "reason"]
-            )
-            return jsonify({"status": "rejected_by_ai"}), 200
-
-        # 同一銘柄2本目禁止
-        if is_in_position(state, symbol):
-            return jsonify({"status": "already_in_position"}), 200
-
-        # ポジション開始
-        open_position(state, symbol, side, now_price)
-        save_state(state)
-        mark_symbol_active(symbol)
-
-        if DISCORD_MAIN:
-            send_discord(
-                DISCORD_MAIN,
-                msg_entry(symbol, side, now_price, tp_target, sl_target)
-            )
-
-        return jsonify({"status": "entry_ok"}), 200
-
-    # -------------------------
-    # 経過系: PRICE_TICK / STEP_UP / STEP_DOWN
-    # -------------------------
-    if signal_type in ["PRICE_TICK", "STEP_UP", "STEP_DOWN"]:
-        # 経過レポートはDiscordに送らないようにしてる
-        return jsonify({"status": "progress_ok"}), 200
-
-    # -------------------------
-    # クローズ: TP / SL / TIMEOUT
-    # -------------------------
-    if signal_type in ["TP", "SL", "TIMEOUT"]:
-        if is_in_position(state, symbol):
-            side = state[symbol]["side"]
-            entry_price = float(state[symbol]["entry_price"])
-            pctv = pct_change(entry_price, now_price, side)
-
-            close_position(state, symbol, now_price, signal_type)
-
-            if DISCORD_MAIN:
-                send_discord(
-                    DISCORD_MAIN,
-                    msg_close(symbol, side, now_price, pctv, signal_type)
-                )
-
-        return jsonify({"status": "close_ok"}), 200
-
-    # それ以外
-    return jsonify({"status": "ignored"}), 200
-
-# ------------------------------------------------------------
-# ルート "/" ヘルスチェック
-# ------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "time": get_jst_now_str()
-    }), 200
-
-# ------------------------------------------------------------
+# ==========================
 # メイン起動
-# ------------------------------------------------------------
+# ==========================
 if __name__ == "__main__":
-    ensure_data_dir()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0", port=10000)
