@@ -10,6 +10,29 @@ import json
 import requests
 import os
 
+# ==========================
+# ログフィルタ (pingとかUptimeRobotのHEADをコンソールに出さない)
+# ==========================
+import logging
+
+class QuietPingFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        # ここに含まれるようなノイズは表示しない
+        if "ping-keepalive" in msg:
+            return False
+        if "UptimeRobot" in msg:
+            return False
+        if "HEAD / " in msg:
+            return False
+        return True
+
+logging.getLogger("werkzeug").addFilter(QuietPingFilter())
+
+# ==========================
+# 既存ロジック（ここから下はあなたのコードそのまま）
+# ==========================
+
 JST = timezone(timedelta(hours=9))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
 SECRET_TOKEN = "super_secret_token_please_match"
@@ -70,16 +93,23 @@ def webhook():
     # === ENTRY系 ===
     if event_type in ["ENTRY_BUY", "ENTRY_SELL"]:
         emoji = "🟢" if event_type == "ENTRY_BUY" else "🔴"
-        msg = f"{emoji}【エントリー】\n銘柄: {symbol} {name}\n方向: {'買い' if side == 'BUY' else '売り'}\n価格: {price}円\n時刻: {jst_time}"
+        msg = (
+            f"{emoji}【エントリー】\n"
+            f"銘柄: {symbol} {name}\n"
+            f"方向: {'買い' if side == 'BUY' else '売り'}\n"
+            f"価格: {price}円\n"
+            f"時刻: {jst_time}"
+        )
         discord_send(msg, 0x00ff00 if side == "BUY" else 0xff3333)
 
     # === PRICE_TICK（AI判断用） ===
     elif event_type == "PRICE_TICK":
+        # これはDiscordに投げずサーバー側で観測だけ
         print(f"📊 PRICE_TICK {symbol}: {price}, pct={pct}")
 
     # === STEP_UP / STEP_DOWN ===
     elif event_type in ["STEP_UP", "STEP_DOWN"]:
-        # 今回はSTEP通知をスキップ（送らない）
+        # あなたの指定どおり：STEP通知は送らない
         pass
 
     # === TP / SL / TIMEOUT ===
