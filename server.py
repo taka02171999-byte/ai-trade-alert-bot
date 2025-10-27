@@ -33,7 +33,7 @@ logging.getLogger("werkzeug").addFilter(QuietPingFilter())
 JST = timezone(timedelta(hours=9))
 
 # RenderのEnvから読む。なかったら""になる
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_MAIN", "")
 
 # TradingView側Pineと合わせる
 SECRET_TOKEN = "super_secret_token_please_match"
@@ -168,3 +168,4 @@ if __name__ == "__main__":
     # RenderのPORT環境変数を信じるようにしてもいいけど
     # あなたの環境は 10000 で固定してるのでそのまま
     app.run(host="0.0.0.0", port=10000)
+
