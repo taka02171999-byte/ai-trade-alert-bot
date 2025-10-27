@@ -1,4 +1,4 @@
-# server.py
+ server.py
 # ========================================
 # AIりんご式 Entry+Follow サーバー（vFINAL_ONECHANCE対応）
 # TradingView → Flask(Webhook) → Discord 通知
