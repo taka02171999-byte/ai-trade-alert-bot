@@ -11,7 +11,7 @@ ENTRY_MODEL_PATH = "data/entry_stats.json"
 DEFAULT_BREAK_PCT   = 0.1   # 初期ブレイク幅(%) 0.1%
 DEFAULT_VOL_REQ     = 2.0   # 初期の出来高倍率しきい値 (平均の2倍以上ほしい)
 DEFAULT_ATR_MIN     = 0.3   # ボラ低すぎ除外
-DEFAULT_ATR_MAX     = 20.0   # ボラ高すぎ除外
+DEFAULT_ATR_MAX     = 30.0   # ボラ高すぎ除外
 DEFAULT_TREND_ABS_P = 0.25  # その足が最低これくらいは動いててほしい(%)
 
 def _load_entry_model():
