@@ -9,27 +9,31 @@ import os, json
 MODEL_PATH = "data/ai_dynamic_thresholds.json"
 
 def _load_model():
+    """
+    銘柄ごとのTP/SLしきい値を毎回読み直す。
+    学習ジョブ(ai_model_trainer.py)が走ったあとの最新値を使うため。
+    """
     if not os.path.exists(MODEL_PATH):
         return {}
     with open(MODEL_PATH, encoding="utf-8") as f:
-        return json.load(f)
-
-# モデル（銘柄別TP/SL閾値）
-MODEL = _load_model()
+        try:
+            return json.load(f)
+        except:
+            return {}
 
 def should_exit_now(position_dict):
     """
     return:
-      (False, None)               → まだホールド
-      (True, ("AI_TP", price_now)) → AI利確
-      (True, ("AI_SL", price_now)) → AI損切り
-      (True, ("AI_TIMEOUT", price_now)) → ダラけたので撤退
+      (False, None)
+      (True, ("AI_TP", price_now))
+      (True, ("AI_SL", price_now))
+      (True, ("AI_TIMEOUT", price_now))
 
     判定材料:
-      - pct: いまの含み%（SELLのときは下落でプラスになるようPine側でそろえてある）
+      - pct: 含み%（SELLは下落でプラスになるようPine側で変換済み）
       - mins_from_entry: 経過分
-      - volume/vwap/atr で状況の熱さ・失速を判断
-      - モデルで銘柄ごとのtp/slを可変
+      - volume / vwap / atr
+      - 銘柄別TP/SLしきい値(MODEL)で可変制御
     """
 
     if not position_dict or position_dict.get("closed"):
@@ -41,38 +45,42 @@ def should_exit_now(position_dict):
 
     last = ticks[-1]
 
-    sym   = position_dict.get("symbol")
-    side  = position_dict.get("side")
-    pct   = float(last.get("pct", 0))
-    price = float(last.get("price", 0))
+    sym         = position_dict.get("symbol")
+    side        = position_dict.get("side")
+    pct         = float(last.get("pct", 0) or 0)
+    price_now   = float(last.get("price", 0) or 0)
+    mins_open   = float(last.get("mins_from_entry", 0) or 0)
+    vol_now     = float(last.get("volume", 0) or 0)
+    atr_now     = float(last.get("atr", 0) or 0)
+    vwap_now    = float(last.get("vwap", 0) or 0)
 
-    mins_open = float(last.get("mins_from_entry", 0) or 0)
-    vol   = float(last.get("volume", 0) or 0)
-    atr   = float(last.get("atr", 0) or 0)
-    vwap  = float(last.get("vwap", 0) or 0)
-
-    # この銘柄専用のTP/SLしきい値（学習結果あれば使う）
+    # 最新モデルをロード（銘柄ごとの tp/sl）
+    MODEL = _load_model()
     thresholds = MODEL.get(sym, {"tp": 1.0, "sl": -0.6})
-    tp = thresholds["tp"]
-    sl = thresholds["sl"]
+    tp = float(thresholds.get("tp", 1.0))
+    sl = float(thresholds.get("sl", -0.6))
 
-    # 出来高が強い＆ATRそこそこ→利幅もっと狙える（tp少し引き上げ）
-    if vol > 0 and atr > 0:
-        heat = min(vol / (atr * 10000.0), 2.0)  # バカみたいに跳ねないようcap
+    # 出来高×ATRがアツいときはもっと引っ張る(利確TPを強気に)
+    if vol_now > 0 and atr_now > 0:
+        heat = min(vol_now / (atr_now * 10000.0), 2.0)
         tp *= heat
 
-    # 逆行が始まってるなら損切りを浅く（-0.4%とか）に引き上げる
-    if side == "BUY" and vwap and price < vwap:
+    # VWAP割れたら損切りラインを浅く (SELLはVWAP上に戻ったら同じ)
+    if side == "BUY" and vwap_now and price_now < vwap_now:
         sl = max(sl, -0.4)
-    if side == "SELL" and vwap and price > vwap:
+    if side == "SELL" and vwap_now and price_now > vwap_now:
         sl = max(sl, -0.4)
 
-    # 判定
+    # 利確判定
     if pct >= tp:
-        return True, ("AI_TP", price)
+        return True, ("AI_TP", price_now)
+
+    # 損切り判定
     if pct <= sl:
-        return True, ("AI_SL", price)
+        return True, ("AI_SL", price_now)
+
+    # ダラけすぎてる場合の撤退
     if mins_open >= 15:
-        return True, ("AI_TIMEOUT", price)
+        return True, ("AI_TIMEOUT", price_now)
 
     return False, None
