@@ -1,30 +1,19 @@
 # position_manager.py
-#
-# ポジション(リアル採用と保留シャドウ)状態を読み書きするユーティリティ
-# 保存先: data/positions_live.json
+# ===============================
+# ポジションの生存/保留/クローズ状態と、1分ごとのtick履歴を
+# data/positions_live.json に保存する。
+# shadow_pending もここで同じように扱う。
+# ===============================
 
-import os
-import json
-from datetime import datetime, timedelta, timezone
+import os, json
+from datetime import datetime, timezone, timedelta
 
 JST = timezone(timedelta(hours=9))
-
 STATE_PATH = "data/positions_live.json"
+LEARN_PATH = "data/learning_log.jsonl"  # 学習用ログ
 
-# 却下してもこの分だけは「スカウト中」にして監視する
-PENDING_OBSERVE_MINUTES = 3
-
-# 同じ銘柄を同時に2本持たない（1銘柄1ポジ想定）
-MAX_ONE_POSITION_PER_SYMBOL = True
-
-
-def _now_jst():
-    return datetime.now(JST)
-
-def _iso_jst(dt=None):
-    if dt is None:
-        dt = _now_jst()
-    return dt.isoformat(timespec="seconds")
+def _now_iso():
+    return datetime.now(JST).isoformat(timespec="seconds")
 
 def _load_all():
     if not os.path.exists(STATE_PATH):
@@ -32,64 +21,56 @@ def _load_all():
     with open(STATE_PATH, "r", encoding="utf-8") as f:
         try:
             return json.load(f)
-        except Exception:
+        except:
             return {}
 
 def _save_all(state):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    os.makedirs("data", exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def start_position(symbol, side, entry_price, accepted_real: bool):
+def _append_learning_log(row: dict):
+    os.makedirs("data", exist_ok=True)
+    with open(LEARN_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+def start_position(symbol, side, price, accepted_real):
     """
-    ENTRY_BUY/ENTRY_SELL 受信時に呼ぶ。
-    accepted_real=True なら status="real"（即Discordに出す対象）
-    Falseなら status="shadow_pending"（保留で数分スカウト）
+    ENTRY受信時に呼ぶ。
+    accepted_real=True → status="real"（=本採用）
+    accepted_real=False → status="shadow_pending"（=保留監視）
     """
     state = _load_all()
 
-    # 既に未クローズのポジがあれば新規は無視（同銘柄2重持ちしない運用）
-    if MAX_ONE_POSITION_PER_SYMBOL and symbol in state:
-        sympos = state[symbol]
-        if sympos.get("closed") is False:
-            return state[symbol]
-
-    pos = {
+    state[symbol] = {
         "symbol": symbol,
-        "side": side,  # "BUY" or "SELL"
-        "entry_price": entry_price,
-        "entry_time": _iso_jst(),
+        "side": side,                     # "BUY" or "SELL"
+        "entry_price": price,
+        "entry_time": _now_iso(),
         "status": "real" if accepted_real else "shadow_pending",
-        # statusは "real" / "shadow_pending" / "shadow_closed"
         "closed": False,
         "close_time": None,
-        "close_price": None,
         "close_reason": None,
-
-        # PRICE_TICKの履歴
-        "ticks": [],
-
-        # 却下スタート時刻（shadow_pendingの観察開始）
-        "pending_start": _iso_jst(),
+        "close_price": None,
+        "ticks": []
     }
 
-    state[symbol] = pos
     _save_all(state)
-    return pos
+    return state[symbol]
 
 def add_tick(symbol, tick_data: dict):
     """
-    PRICE_TICKで毎分呼ばれる。
-    tick_dataの例:
-    {
-      "t": "2025-10-29T09:41:00+09:00",
-      "price": float,
-      "pct": float,
-      "mins_from_entry": float|None,
-      "vwap": float,
-      "atr": float,
-      "volume": float
-    }
+    PRICE_TICKごとに呼ぶ。
+    tick_data例:
+      {
+        "t": <JST時刻ISO>,
+        "price": float,
+        "pct": float,
+        "mins_from_entry": float,
+        "volume": float,
+        "vwap": float,
+        "atr": float
+      }
     """
     state = _load_all()
     if symbol not in state:
@@ -97,7 +78,6 @@ def add_tick(symbol, tick_data: dict):
 
     pos = state[symbol]
     if pos.get("closed"):
-        # すでにクローズ済みなら追記だけしない
         return pos
 
     pos["ticks"].append(tick_data)
@@ -105,63 +85,10 @@ def add_tick(symbol, tick_data: dict):
     _save_all(state)
     return pos
 
-def promote_to_real(symbol):
+def force_close(symbol, reason, price_now, pct_now=None):
     """
-    shadow_pending → real に格上げ。
-    これでDiscordに“後追いエントリー”を出せる状態になる。
-    """
-    state = _load_all()
-    if symbol not in state:
-        return None
-
-    pos = state[symbol]
-    if pos.get("closed"):
-        return pos
-
-    if pos.get("status") == "shadow_pending":
-        pos["status"] = "real"
-        state[symbol] = pos
-        _save_all(state)
-
-    return pos
-
-def maybe_expire_shadow(symbol):
-    """
-    shadow_pendingを一定時間見たけど
-    昇格させなかった場合は自然終了 (=学習用の"見送りでした"として閉じる)。
-    """
-    state = _load_all()
-    if symbol not in state:
-        return None, False
-
-    pos = state[symbol]
-
-    if pos.get("closed"):
-        return pos, False
-
-    if pos.get("status") != "shadow_pending":
-        return pos, False
-
-    try:
-        start_dt = datetime.fromisoformat(pos["pending_start"])
-    except Exception:
-        start_dt = _now_jst()
-
-    if _now_jst() - start_dt >= timedelta(minutes=PENDING_OBSERVE_MINUTES):
-        # 期限切れでクローズ
-        pos["status"] = "shadow_closed"
-        pos["closed"] = True
-        pos["close_time"] = _iso_jst()
-        pos["close_reason"] = "expired_pending"
-        state[symbol] = pos
-        _save_all(state)
-        return pos, True
-
-    return pos, False
-
-def force_close(symbol, reason, price_now=None):
-    """
-    AIの判断 or PineからのTP/SL/TIMEOUTでポジ終了させたい時に呼ぶ。
+    AI利確/損切 or PineのTP/SL/TIMEOUT保険でクローズするとき呼ぶ。
+    ここで learning_log に1行吐く（学習用）。
     """
     state = _load_all()
     if symbol not in state:
@@ -169,25 +96,44 @@ def force_close(symbol, reason, price_now=None):
 
     pos = state[symbol]
 
+    # 既に閉じてたら2重で閉めない
     if pos.get("closed"):
-        # もう終わってるなら何もしない
         return pos
 
     pos["closed"] = True
-    # shadow_pending/shadow_closed系は"shadow_closed"として止める
-    if pos["status"].startswith("shadow"):
-        pos["status"] = "shadow_closed"
-    pos["close_time"] = _iso_jst()
-    pos["close_price"] = price_now
+    pos["close_time"] = _now_iso()
     pos["close_reason"] = reason
+    pos["close_price"] = price_now
+
+    # 最終損益（%）っぽいもの
+    final_pct = pct_now
+    if final_pct is None:
+        # 最後のtickから拾う
+        if pos["ticks"]:
+            final_pct = pos["ticks"][-1].get("pct")
+        else:
+            final_pct = None
 
     state[symbol] = pos
     _save_all(state)
+
+    # 学習ログに書き出し（shadow_pendingも含める）
+    learn_row = {
+        "symbol": symbol,
+        "side": pos.get("side"),
+        "entry_price": pos.get("entry_price"),
+        "close_price": price_now,
+        "close_reason": reason,
+        "final_pct": final_pct,
+        "ticks": pos.get("ticks", []),
+        "status": pos.get("status"),
+        "entry_time": pos.get("entry_time"),
+        "close_time": pos.get("close_time"),
+    }
+    _append_learning_log(learn_row)
+
     return pos
 
 def get_position(symbol):
     state = _load_all()
     return state.get(symbol)
-
-def get_all_positions():
-    return _load_all()
