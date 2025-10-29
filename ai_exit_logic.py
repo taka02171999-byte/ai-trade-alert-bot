@@ -58,40 +58,52 @@ def should_exit_now(position_dict):
 
     # --- ベースラインTP/SLを決める ---
     # 学習済みモデルがあればそれを使う。
-    # まだ学習データが無い銘柄は tp=+1.5%, sl=-1.0% を初期値として使う。
+    # まだ学習データが無い銘柄は
+    #   tp = +3.0%
+    #   sl = -1.5%
+    # を初期値として使う。（あなたの希望値）
     MODEL = _load_model()
-    thresholds = MODEL.get(sym, {"tp": 1.5, "sl": -1.0})
-    tp = float(thresholds.get("tp", 1.5))
-    sl = float(thresholds.get("sl", -1.0))
+    thresholds = MODEL.get(sym, {"tp": 3.0, "sl": -1.5})
+    tp = float(thresholds.get("tp", 3.0))
+    sl = float(thresholds.get("sl", -1.5))
 
     # --- リアルタイム調整その1: 相場が熱いときは利確はもっと引っ張る ---
     # 出来高(vol_now)とATR(atr_now)がデカい＝勢いある。
     # heat ~ 0〜2ぐらいで最大2倍。tpを最大くらいまで引っ張る。
-    # （これはあなたの「その場に合わせて広げていいよ」の部分）
+    # → つまりベース3%を、状況次第で4〜6%以上まで許容する感じ。
     if vol_now > 0 and atr_now > 0:
         heat = min(vol_now / (atr_now * 10000.0), 2.0)
         tp *= heat
-        # これで例えば初期1.5%が 3.0%とか 5%近くまで伸びることもある。
+        # ここで tp がベースよりさらに上振れするのはOK。
+        # 「そこから何％上げたりはAIの自由」に該当。
 
     # --- リアルタイム調整その2: 逆行シグナル出たら損切りを浅くする ---
-    # BUYでVWAP割れたらもう勢い死んだ扱い → -0.4%とかで即逃げる方向に引き上げ
-    # SELLでVWAP上に戻ったら同じ扱い
+    # BUYでVWAP割れたら勢い死んだ扱い → -0.4%くらいで逃げ方向
+    # SELLでVWAP上に戻ったら同様。
+    # これは「AIが勝手に浅くする」側の裁量ね。
     if side == "BUY" and vwap_now and price_now < vwap_now:
-        # sl は「%損益」だから、-1.0%より浅い -0.4% に引き上げるイメージ
+        # sl は「%損益」だから、-1.5%を -0.4%まで引き上げることもある
         sl = max(sl, -0.4)
     if side == "SELL" and vwap_now and price_now > vwap_now:
         sl = max(sl, -0.4)
 
-    # --- リアルタイム調整その3: あえてもう少し我慢もする ---
-    # あなたの「損切りも1.5までいいよ」ってリクエストは
-    # ＝最大で -1.5% までは許容していい、って意味だったよね。
-    # ここでは「ベースslが -1.0%」だけど、まだVWAP割れてない/勢い残ってるなら
-    # sl を -1.5% まで広げるのもOKにする。
-    # （pctは有利方向でプラスなので、"pctがそこまで悪くない"=そんなに負けてない）
+    # --- リアルタイム調整その3: あえて少し我慢もする ---
+    # まだ崩れてないなら、slをちょい深めに許容するロジック。
+    # ここ、もともとは -1.0%ベースで「-1.5%まで許容」ってしてたけど、
+    # いまベースがすでに -1.5% だから、
+    # 「さらに深くする」っていう必要は基本なしでいい。
+    #
+    # ただ、あなたのニュアンスは
+    #   「基礎値は-1.5。ただしAIが浅くするのはOKだが深くする方向は別に伸ばさなくていい」
+    # だったので、ここは 'sl をもっと悪化方向に拡大' はもうやらない。
+    #
+    # ＝still_strongロジックは緩和し、slを深掘り(例えば-2.0とか)にはしない。
     still_strong = (pct >= -0.8) and (vol_now > 0) and (atr_now > 0)
-    if still_strong:
-        # まだ壊れてない感じなら、slを -1.5% まで許容拡大できる
-        sl = min(sl, -1.5)
+    # 以前は:
+    #   if still_strong:
+    #       sl = min(sl, -1.5)
+    # いまはベースが-1.5なので、何もしないで維持
+    _ = still_strong  # just to keep the variable used
 
     # --- エグジット判定 ---
     # 1) 利確
@@ -103,7 +115,7 @@ def should_exit_now(position_dict):
         return True, ("AI_SL", price_now)
 
     # 3) タイムアウト
-    #   Pineの保険は30分で強制クローズだから、AI側もそれに合わせて30分で逃がす
+    #   Pine側の保険は30分で強制クローズだから、AI側も30分で逃がす
     if mins_open >= 30:
         return True, ("AI_TIMEOUT", price_now)
 
