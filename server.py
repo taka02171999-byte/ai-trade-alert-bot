@@ -74,7 +74,7 @@ def append_trade_log(row: dict):
       "side": "BUY"/"SELL",
       "entry_price": ...,
       "exit_price": ...,
-      "pnl_pct": ...,
+      "pnl": ...,
       "reason": "ENTRY" / "AI_TP" / "AI_SL" / ...,
     }
     """
@@ -90,7 +90,7 @@ def append_trade_log(row: dict):
                 "side",
                 "entry_price",
                 "exit_price",
-                "pnl_pct",
+                "pnl",
                 "reason",
             ],
         )
@@ -114,7 +114,7 @@ def webhook():
     symbol     = payload.get("symbol", "")
     side       = payload.get("side", "")  # "BUY"/"SELL"
     price_now  = float(payload.get("price", 0))
-    pct_now    = payload.get("pct_from_entry")  # Pine側でpct_from_entry送ってくる
+    pct_now    = payload.get("pct_from_entry")
     if pct_now is not None:
         try:
             pct_now = float(pct_now)
@@ -127,13 +127,11 @@ def webhook():
     # 1) ENTRY_BUY / ENTRY_SELL
     # ==========================
     if event_type in ["ENTRY_BUY", "ENTRY_SELL"]:
-        # Pineから来た追加情報（勢いとか）
         vol_mult  = float(payload.get("vol_mult", 1.0))
         vwap      = float(payload.get("vwap", 0.0))
         atr       = float(payload.get("atr", 0.0))
         last_pct  = float(payload.get("last_pct", 0.0))
 
-        # AIで「即エントリー(=real)か、とりあえずshadow_pendingか」を判定
         accept, reason = ai_entry_logic.should_accept_entry(
             symbol,
             side,
@@ -143,7 +141,6 @@ def webhook():
             last_pct
         )
 
-        # ポジション開始を記録
         pos_info = position_manager.start_position(
             symbol=symbol,
             side=side,
@@ -151,12 +148,11 @@ def webhook():
             accepted_real=accept
         )
 
-        # active_symbolsに入れる（クールダウン管理など用）
+        # ここで『保留(shadow_pending)もactive扱いでいい』なら常に呼ぶ
         orchestrator.mark_symbol_active(symbol)
 
-        # Discord通知
         if accept:
-            # 本採用（"🟢エントリー確定"）
+            # Discord: 本採用
             msg = (
                 f"🟢エントリー確定\n"
                 f"銘柄: {symbol} {jp_name(symbol)}\n"
@@ -167,19 +163,19 @@ def webhook():
             )
             send_discord(msg, 0x00ff00 if side=="BUY" else 0xff3333)
 
-            # ★ここでログ行を追加（ENTRYとして記録）
+            # ENTRYログを残す
             append_trade_log({
                 "timestamp": jst_now().isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "side": side,
                 "entry_price": price_now,
                 "exit_price": "",
-                "pnl_pct": "",
+                "pnl": "",
                 "reason": "ENTRY",
             })
 
         else:
-            # 保留（shadowウォッチ）→これはレポには入れたくないのでログしない
+            # Discord: 保留
             msg = (
                 f"🕓エントリー保留監視中\n"
                 f"銘柄: {symbol} {jp_name(symbol)}\n"
@@ -194,8 +190,6 @@ def webhook():
 
     # ==========================
     # 2) PRICE_TICK
-    #    毎分のスナップショット
-    #    → AI利確/損切/タイムアウト判定
     # ==========================
     elif event_type == "PRICE_TICK":
         tick = {
@@ -210,20 +204,16 @@ def webhook():
 
         pos_before = position_manager.add_tick(symbol, tick)
         if not pos_before:
-            # 未登録 or すでに閉じたやつかも
             print(f"[INFO] PRICE_TICK for unknown or closed {symbol}")
             return jsonify({"status": "ok"})
 
-        # もう閉じてたら何もしない
         if pos_before.get("closed"):
             return jsonify({"status": "ok"})
 
-        # ===== AI出口判定 =====
         wants_exit, exit_info = ai_exit_logic.should_exit_now(pos_before)
         if wants_exit and exit_info:
-            exit_type, exit_price = exit_info  # e.g. ("AI_TP", 3050.5)
+            exit_type, exit_price = exit_info  # "AI_TP"とか
 
-            # クローズ処理（学習ログにも保存される）
             closed_pos = position_manager.force_close(
                 symbol,
                 reason=exit_type,
@@ -233,7 +223,6 @@ def webhook():
 
             orchestrator.mark_symbol_closed(symbol)
 
-            # Discord通知
             if exit_type == "AI_TP":
                 kind_label = "AI利確🎯"
                 color = 0x33ccff
@@ -253,14 +242,13 @@ def webhook():
             )
             send_discord(msg, color)
 
-            # ★ここでログ行を追加（EXITとして記録）
             append_trade_log({
                 "timestamp": jst_now().isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "side": closed_pos.get("side", side),
                 "entry_price": closed_pos.get("entry_price", ""),
                 "exit_price": exit_price,
-                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
+                "pnl": round(pct_now,2) if pct_now is not None else "",
                 "reason": exit_type,
             })
 
@@ -268,7 +256,6 @@ def webhook():
 
     # ==========================
     # 3) TP / SL / TIMEOUT
-    #    Pine側の保険エグジット
     # ==========================
     elif event_type in ["TP", "SL", "TIMEOUT"]:
         closed_pos = position_manager.force_close(
@@ -282,7 +269,6 @@ def webhook():
 
         already_ai = closed_pos and closed_pos.get("close_reason","").startswith("AI_")
         if not already_ai:
-            # 通知内容
             if event_type == "TP":
                 kind_label = "利確🎯"
                 color = 0x33ccff
@@ -302,22 +288,18 @@ def webhook():
             )
             send_discord(msg, color)
 
-            # ★ここでログ行を追加（EXITとして記録）
             append_trade_log({
                 "timestamp": jst_now().isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "side": closed_pos.get("side", side) if closed_pos else side,
                 "entry_price": closed_pos.get("entry_price", "") if closed_pos else "",
                 "exit_price": price_now,
-                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
+                "pnl": round(pct_now,2) if pct_now is not None else "",
                 "reason": event_type,
             })
 
         return jsonify({"status": "ok"})
 
-    # ==========================
-    # その他
-    # ==========================
     else:
         print(f"[INFO] 未対応event {event_type} payload={payload}")
         return jsonify({"status": "ok", "note": "unhandled"})
