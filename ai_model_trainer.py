@@ -1,9 +1,8 @@
 # ai_model_trainer.py
 # ===============================
-# 学習ログ(data/learning_log.jsonl)を読んで
-# 銘柄ごとに「このくらいで利確できてた」「これ以上持つと危ない」という
-# tp/slの目安を data/ai_dynamic_thresholds.json に書き出す。
-# （日次/週次バッチで実行する想定）
+# data/learning_log.jsonl を読んで、
+# 銘柄ごとの「このくらいの利幅でやめるのが現実的」「ここまで行ったらヤバい」を
+# data/ai_dynamic_thresholds.json に保存する。
 # ===============================
 
 import json, os, statistics
@@ -15,32 +14,36 @@ def train_dynamic_thresholds():
     if not os.path.exists(LEARN_PATH):
         return {}
 
-    stats = {}
+    per_symbol = {}
     with open(LEARN_PATH, encoding="utf-8") as f:
         for line in f:
             try:
                 row = json.loads(line)
             except:
                 continue
+
             sym = row.get("symbol")
             final_pct = row.get("final_pct")
             if sym is None or final_pct is None:
                 continue
+
             try:
-                fp = float(final_pct)
+                p = float(final_pct)
             except:
                 continue
-            stats.setdefault(sym, []).append(fp)
+
+            per_symbol.setdefault(sym, []).append(p)
 
     model = {}
-    for sym, plist in stats.items():
-        avg = statistics.mean(plist)
-        std = statistics.pstdev(plist) if len(plist) > 1 else 0.3
-        # 「だいたいこのくらいまで伸びる」がtp、
-        # 「これ超えて負けてることが多い」がslみたいなイメージ
+    for sym, arr in per_symbol.items():
+        avg = statistics.mean(arr)
+        std = statistics.pstdev(arr) if len(arr) > 1 else 0.3
+
+        # tp = 平均 + ちょい上振れ
+        # sl = 平均 - もっと下振れ
         model[sym] = {
             "tp": round(avg + std * 1.2, 2),
-            "sl": round(avg - std * 1.5, 2)
+            "sl": round(avg - std * 1.5, 2),
         }
 
     os.makedirs("data", exist_ok=True)
