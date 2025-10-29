@@ -1,15 +1,32 @@
+# orchestrator.py
+# ===============================
+# エントリー/クローズ周りの軽い管理。
+#
+# もともとは:
+#   - active_symbols に今監視中の銘柄を入れる
+#   - クローズ後に同じ銘柄へすぐ再エントリーしないように cooldown する
+#
+# 今回の版では、あなたの希望どおり
+# 「同じ銘柄でもすぐまた入ってOK」にするため、
+# クールダウン機能は実質オフにしてある。
+#
+# server.py 側は
+#   orchestrator.mark_symbol_active(symbol)
+#   orchestrator.mark_symbol_closed(symbol)
+# を呼んでくるけど、
+# それらは今も安全に動くようにしてある。
+#
+# should_accept_signal() も残してあるけど、
+# server.py では使っていないので特に影響なし。
+# ===============================
+
 import os
 import json
 from datetime import datetime, timedelta
 
-# 状態ファイル
-ORCH_STATE_PATH = "data/orchestrator_state.json"
-
-# 何分クールダウンさせるか（同じ銘柄を連打しないように）
-DEFAULT_COOLDOWN_MIN = 5
-
-# いちおうアクティブ銘柄の上限。多すぎると監視がカオスになるので切り詰める
 TOP_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "10"))
+
+ORCH_STATE_PATH = "data/orchestrator_state.json"
 
 
 def _utc_now():
@@ -20,138 +37,151 @@ def _now_iso():
     return _utc_now().isoformat(timespec="seconds")
 
 
-def _load_state():
+def load_orch():
     """
-    orchestrator_state.json の形:
+    orchestrator_state.json の現在の状態を読む。
+    フォーマット例:
     {
-      "active_symbols": ["7203.T", "6758.T", ...],
-      "cooldown": {
-         "7203.T": "2025-10-26T08:15:00",
-         ...
-      }
+        "active_symbols": ["7203.T","6758.T", ...],
+        "cooldown": {
+            "7203.T": "2025-10-25T10:00:00"
+        }
     }
-    無ければ初期状態を返す。
+    cooldownは今回は無効化するけど、互換性のために残してある。
     """
     if not os.path.exists(ORCH_STATE_PATH):
         return {
             "active_symbols": [],
             "cooldown": {}
         }
-    try:
-        with open(ORCH_STATE_PATH, "r", encoding="utf-8") as f:
+    with open(ORCH_STATE_PATH, "r", encoding="utf-8") as f:
+        try:
             return json.load(f)
-    except:
-        return {
-            "active_symbols": [],
-            "cooldown": {}
-        }
+        except:
+            # 壊れてたら初期状態で返す
+            return {
+                "active_symbols": [],
+                "cooldown": {}
+            }
 
 
-def _save_state(state: dict):
-    os.makedirs(os.path.dirname(ORCH_STATE_PATH) or ".", exist_ok=True)
+def save_orch(state):
+    os.makedirs(os.path.dirname(ORCH_STATE_PATH), exist_ok=True)
     with open(ORCH_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def _is_on_cooldown(symbol: str, st: dict) -> bool:
+# ===============================
+# クールダウン関連（今回は無効化）
+# ===============================
+
+def is_cooldown(symbol, orch_state):
     """
-    クールダウン中なら True
+    クールダウン中かどうかを判定する関数。
+    以前は "cooldown" 辞書の時刻を見て True/False を返していた。
+
+    今回は「同じ銘柄でも即もう一回入ってOK」にしたいので
+    常に False を返すようにする。
     """
-    cd = st.get("cooldown", {})
-    if symbol not in cd:
-        return False
-
-    until_str = cd[symbol]
-    try:
-        until_dt = datetime.fromisoformat(until_str)
-    except:
-        # パースできないならクールダウン扱いしないで解除しちゃう
-        return False
-
-    return _utc_now() < until_dt
+    return False
 
 
-def _set_cooldown(symbol: str, minutes: int = DEFAULT_COOLDOWN_MIN):
+def put_cooldown(symbol, minutes=5):
     """
-    この銘柄をしばらく触らないようにクールダウンする
+    以前はここで cooldown に '今+5分' を入れてた。
+    今回はクールダウン機能オフなので、何もしない。
     """
-    st = _load_state()
-    st.setdefault("cooldown", {})
-    st["cooldown"][symbol] = (_utc_now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
-    _save_state(st)
+    # no-op: cooldownを記録しない
+    return
 
 
-def _refresh_top_symbols(st: dict):
+# ===============================
+# active_symbols管理
+# ===============================
+
+def refresh_top_symbols():
     """
-    active_symbolsをTOP_LIMIT件に切り詰めるだけの単純な優先度管理。
-    先頭がよりホットなやつ。
+    active_symbols が変に増えすぎたら TOP_LIMIT 件までに縮める。
+    （古い後ろのやつを落とすイメージ）
+
+    ここは今まで通り残す。
     """
-    active_list = st.get("active_symbols", [])
-    st["active_symbols"] = active_list[:TOP_LIMIT]
+    orch_state = load_orch()
+    active = orch_state.get("active_symbols", [])
+    orch_state["active_symbols"] = active[:TOP_LIMIT]
+    save_orch(orch_state)
 
 
-def mark_symbol_active(symbol: str):
+def mark_symbol_active(symbol):
     """
-    その銘柄を「いま監視中/稼働中のホットな銘柄」として active_symbols の先頭に入れる。
-    - ENTRY直後
-    - shadow_pending→realに昇格した瞬間
-    で呼んでる。
+    server.py のENTRY時に呼ばれる。
+    監視中シンボルリスト(active_symbols)の先頭に突っ込む。
     """
-    st = _load_state()
+    orch_state = load_orch()
 
-    # 既に入ってたら一旦消して、先頭に入れ直す（優先度UP）
-    active = st.get("active_symbols", [])
-    if symbol in active:
-        active.remove(symbol)
-    active.insert(0, symbol)
-    st["active_symbols"] = active
+    if "active_symbols" not in orch_state:
+        orch_state["active_symbols"] = []
+    if "cooldown" not in orch_state:
+        orch_state["cooldown"] = {}
 
-    # 一応クールダウン解除されてても問題ない、放置でOK
-    # （もしクールダウン中にまたシグナルが来たらAIが決めるので）
+    # すでに入ってたら一回消してから先頭に入れる（優先度を一番上に）
+    if symbol in orch_state["active_symbols"]:
+        orch_state["active_symbols"].remove(symbol)
+    orch_state["active_symbols"].insert(0, symbol)
 
-    _refresh_top_symbols(st)
-    _save_state(st)
+    # リストがデカくなりすぎないように整える
+    orch_state["active_symbols"] = orch_state["active_symbols"][:TOP_LIMIT]
+
+    save_orch(orch_state)
 
 
-def mark_symbol_closed(symbol: str):
+def mark_symbol_closed(symbol):
     """
-    決済が完了したときに呼ぶ。
-    - クールダウンをセットして、すぐ再エントリー連打しにくくする
+    server.py のEXIT時に呼ばれる。
+
+    以前は:
+      - put_cooldown(symbol, minutes=5) でクールダウン入れてた
+    今回は:
+      - クールダウン廃止なので何もしない（記録だけしておしまい）
+
+    将来的に「この銘柄はしばらく危険だから避けろ」とかやりたくなったら、
+    ここにロジックを復活させればいい。
     """
-    _set_cooldown(symbol, minutes=DEFAULT_COOLDOWN_MIN)
-
-    # active_symbolsから消すかどうかは運用次第。
-    # ここで消しておく。
-    st = _load_state()
-    if symbol in st.get("active_symbols", []):
-        st["active_symbols"].remove(symbol)
-    _refresh_top_symbols(st)
-    _save_state(st)
+    orch_state = load_orch()
+    # active_symbols からは消さない。むしろ残しといてOK。
+    # cooldown も書かない。
+    save_orch(orch_state)
 
 
-# ===== （注意） =====
-# 前バージョンでは server.py 側が ENTRY受信のときに
-# orchestrator.should_accept_signal() を呼んで
-# "active_symbolsに入ってなきゃ拒否" とかやってた。
-#
-# 今の最終フローではエントリー可否は ai_entry_logic.should_accept_entry() に
-# 100%任せてるから、こっちはもう使わない。
-#
-# ただ、将来この関数をまた呼びたくなった時に落ちないように
-# ダミーで置いておく。
-def should_accept_signal(symbol: str, side: str):
+# ===============================
+# エントリー可否チェック (将来用)
+# ===============================
+
+def should_accept_signal(symbol, side):
     """
-    互換目的のダミー。
-    いまはAI判断が優先なので、基本常に受け入れる側にする。
-    tp/sl目標はここでは決めていないので None。
+    昔の構想では、ここで
+      - クールダウン中なら拒否
+      - active_symbolsに入ってるか
+      - ここでTP/SL目安返す
+    みたいなフィルタをかけてサーバーのENTRYを決める想定だった。
+
+    でも今の server.py は ai_entry_logic.should_accept_entry() で判断してるので
+    実際にはこの関数は呼ばれていない。
+
+    一応インターフェースだけ残しておく。
     """
-    st = _load_state()
+    orch_state = load_orch()
+    refresh_top_symbols()
 
-    # クールダウン中なら「まぁ一応警戒」って扱いにしておきたいならここでFalse返す。
-    # ただし今のフローでは ai_entry_logic がメイン意思決定者なので、
-    # ここではTrueを返してサーバーのロジックとケンカしないようにする。
-    on_cd = _is_on_cooldown(symbol, st)
-    if on_cd:
-        return False, "cooldown", None, None
+    # クールダウンは常にFalseなのでここでは無視
+    # in_top も現状は意味だけ残す
+    in_top = True  # 今は基本ぜんぶ通す
 
-    return True, "", None, None
+    if not in_top:
+        return False, "not_in_top", None, None
+
+    # TP/SL目安はまだ学習してないので None
+    tp_target = None
+    sl_target = None
+
+    return True, "", tp_target, sl_target
