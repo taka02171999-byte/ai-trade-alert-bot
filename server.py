@@ -1,29 +1,28 @@
 # server.py
 # ===============================
-# TradingView → Flask(Webhook) → AI判断 → Discord通知
-# - ENTRY_BUY/SELL: 今すぐ入る？とりあえず保留？を決める
-# - PRICE_TICK: 1分ごとの状態から「AI利確/損切り/タイムアウト」判断
-# - shadow_pendingだったやつを後追いで昇格させて“エントリー通知”もできる
-# - Pine側のTP/SL/TIMEOUTは最終保険
+# TradingView -> Flask webhook受信 -> AI判断 -> Discord通知 + trade_log記録
 # ===============================
 
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone, timedelta
-import os, json, requests
+import os, json, requests, csv
 
 import ai_entry_logic
 import ai_exit_logic
 import position_manager
-import orchestrator  # active_symbols管理とか cooldown入れるやつ
+import orchestrator  # active_symbolsとかクールダウン管理
 
 JST = timezone(timedelta(hours=9))
+
 app = Flask(__name__)
 
-# ----- 環境変数 -----
+# Render 環境変数
 SECRET_TOKEN = os.getenv("TV_SHARED_SECRET", "super_secret_token_please_match")
 DISCORD_WEBHOOK_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
 
-# ----- 銘柄の日本語名辞書 -----
+TRADE_LOG_PATH = "data/trade_log.csv"
+
+# 銘柄の日本語名辞書
 SYMBOL_NAMES_PATH = "data/symbol_names.json"
 if os.path.exists(SYMBOL_NAMES_PATH):
     with open(SYMBOL_NAMES_PATH, "r", encoding="utf-8") as f:
@@ -34,8 +33,11 @@ else:
 def jp_name(symbol: str) -> str:
     return SYMBOL_NAMES.get(symbol, symbol)
 
+def jst_now():
+    return datetime.now(JST)
+
 def jst_now_str():
-    return datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+    return jst_now().strftime("%Y/%m/%d %H:%M:%S")
 
 def send_discord(msg: str, color: int = 0x00ccff):
     """
@@ -56,13 +58,45 @@ def send_discord(msg: str, color: int = 0x00ccff):
             }
         ]
     }
-
     try:
         resp = requests.post(DISCORD_WEBHOOK_MAIN, json=data, timeout=5)
         print(f"Discord送信 status={resp.status_code}")
     except Exception as e:
         print(f"Discord送信エラー: {e}")
         print("FAILED MSG >>>", msg)
+
+def append_trade_log(row: dict):
+    """
+    trade_log.csv に1行追記する。
+    rowは {
+      "timestamp": ISO文字列,
+      "symbol": "...",
+      "side": "BUY"/"SELL",
+      "entry_price": ...,
+      "exit_price": ...,
+      "pnl_pct": ...,
+      "reason": "ENTRY" / "AI_TP" / "AI_SL" / ...,
+    }
+    """
+    os.makedirs("data", exist_ok=True)
+
+    file_exists = os.path.exists(TRADE_LOG_PATH)
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "timestamp",
+                "symbol",
+                "side",
+                "entry_price",
+                "exit_price",
+                "pnl_pct",
+                "reason",
+            ],
+        )
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 @app.route("/webhook", methods=["POST"])
@@ -72,63 +106,57 @@ def webhook():
     if not payload:
         return jsonify({"status": "error", "reason": "no data"}), 400
 
-    # TradingViewとの共有シークレットチェック
+    # secretチェック
     if payload.get("secret") != SECRET_TOKEN:
         return jsonify({"status": "error", "reason": "invalid secret"}), 403
 
     event_type = payload.get("type", "")
     symbol     = payload.get("symbol", "")
     side       = payload.get("side", "")  # "BUY"/"SELL"
-    # Pineが送ってきたエントリー価格/最新価格
-    try:
-        price_now = float(payload.get("price", 0) or 0)
-    except:
-        price_now = 0.0
+    price_now  = float(payload.get("price", 0))
+    pct_now    = payload.get("pct_from_entry")  # Pine側でpct_from_entry送ってくる
+    if pct_now is not None:
+        try:
+            pct_now = float(pct_now)
+        except:
+            pct_now = None
 
-    # Pineが送ってくる「エントリーからの％」(SELLの場合は有利側を+にしてくれてる)
-    raw_pct = payload.get("pct_from_entry")
-    try:
-        pct_now = float(raw_pct)
-    except:
-        pct_now = None
+    print(f"[WEBHOOK] {event_type} {symbol} {side} {price_now} pct={pct_now} at {jst_now_str()}")
 
-    print(f"[WEBHOOK] {event_type} {symbol} side={side} price={price_now} pct={pct_now} at {jst_now_str()}")
-
-    # ============================================================
-    # 1) ENTRY_BUY / ENTRY_SELL : 新規シグナル
-    # ============================================================
+    # ==========================
+    # 1) ENTRY_BUY / ENTRY_SELL
+    # ==========================
     if event_type in ["ENTRY_BUY", "ENTRY_SELL"]:
-        # Pine側から送ってほしい情報（安全にfloat化しとく）
-        def safe_float(x, default=0.0):
-            try:
-                return float(x)
-            except:
-                return default
+        # Pineから来た追加情報（勢いとか）
+        vol_mult  = float(payload.get("vol_mult", 1.0))
+        vwap      = float(payload.get("vwap", 0.0))
+        atr       = float(payload.get("atr", 0.0))
+        last_pct  = float(payload.get("last_pct", 0.0))
 
-        vol_mult = safe_float(payload.get("vol_mult", 1.0), 1.0)      # 出来高スパイク倍率
-        vwap     = safe_float(payload.get("vwap", 0.0), 0.0)
-        atr      = safe_float(payload.get("atr", 0.0), 0.0)
-        last_pct = safe_float(payload.get("last_pct", 0.0), 0.0)       # 直近5分の伸び率とか
-
-        # AIで「即リアル or 保留シャドウ」を判定
+        # AIで「即エントリー(=real)か、とりあえずshadow_pendingか」を判定
         accept, reason = ai_entry_logic.should_accept_entry(
-            symbol, side, vol_mult, vwap, atr, last_pct
+            symbol,
+            side,
+            vol_mult,
+            vwap,
+            atr,
+            last_pct
         )
 
-        # ポジションを記録（status="real" or "shadow_pending"）
-        position_manager.start_position(
+        # ポジション開始を記録
+        pos_info = position_manager.start_position(
             symbol=symbol,
             side=side,
             price=price_now,
             accepted_real=accept
         )
 
-        # orchestrator 側の追跡リストにも登録だけはする
+        # active_symbolsに入れる（クールダウン管理など用）
         orchestrator.mark_symbol_active(symbol)
 
-        # Discordへ
+        # Discord通知
         if accept:
-            # 即IN
+            # 本採用（"🟢エントリー確定"）
             msg = (
                 f"🟢エントリー確定\n"
                 f"銘柄: {symbol} {jp_name(symbol)}\n"
@@ -138,25 +166,37 @@ def webhook():
                 f"時刻: {jst_now_str()}"
             )
             send_discord(msg, 0x00ff00 if side=="BUY" else 0xff3333)
+
+            # ★ここでログ行を追加（ENTRYとして記録）
+            append_trade_log({
+                "timestamp": jst_now().isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "side": side,
+                "entry_price": price_now,
+                "exit_price": "",
+                "pnl_pct": "",
+                "reason": "ENTRY",
+            })
+
         else:
-            # 保留監視
+            # 保留（shadowウォッチ）→これはレポには入れたくないのでログしない
             msg = (
                 f"🕓エントリー保留監視中\n"
                 f"銘柄: {symbol} {jp_name(symbol)}\n"
                 f"方向: {'買い' if side=='BUY' else '売り'}\n"
                 f"価格: {price_now}\n"
                 f"理由: {reason}\n"
-                f"※AIが数分間後追い監視。よく育ったら後出しで正式エントリー通知します。"
+                f"※AIがしばらく後追い監視して、良ければ後出しで『エントリー』通知します"
             )
             send_discord(msg, 0xaaaaaa)
 
         return jsonify({"status": "ok"})
 
-    # ============================================================
-    # 2) PRICE_TICK : 毎分のスナップショット
-    #    → shadow_pendingの昇格チェック
-    #    → AIの利確/損切り/タイムアウト判断
-    # ============================================================
+    # ==========================
+    # 2) PRICE_TICK
+    #    毎分のスナップショット
+    #    → AI利確/損切/タイムアウト判定
+    # ==========================
     elif event_type == "PRICE_TICK":
         tick = {
             "t": datetime.now(JST).isoformat(timespec="seconds"),
@@ -170,42 +210,20 @@ def webhook():
 
         pos_before = position_manager.add_tick(symbol, tick)
         if not pos_before:
-            # 既にクローズ済み/存在しない
-            print(f"[INFO] PRICE_TICK for unknown {symbol}")
+            # 未登録 or すでに閉じたやつかも
+            print(f"[INFO] PRICE_TICK for unknown or closed {symbol}")
             return jsonify({"status": "ok"})
 
+        # もう閉じてたら何もしない
         if pos_before.get("closed"):
-            # もう閉じてるならここで終了
             return jsonify({"status": "ok"})
 
-        # --------- (A) shadow_pending → real 昇格チェック ---------
-        if pos_before.get("status") == "shadow_pending":
-            if ai_entry_logic.should_promote_to_real(pos_before):
-                # 格上げ
-                pos_after = position_manager.promote_to_real(symbol)
-                if pos_after and pos_after.get("status") == "real":
-                    # Discordに「後追いだけど正式エントリー入りました」って出す
-                    side_now = pos_after.get("side", side)
-                    msg = (
-                        f"🟢(後追い)エントリー確定\n"
-                        f"銘柄: {symbol} {jp_name(symbol)}\n"
-                        f"方向: {'買い' if side_now=='BUY' else '売り'}\n"
-                        f"今の価格: {price_now}\n"
-                        f"時刻: {jst_now_str()}\n"
-                        f"※保留監視から昇格"
-                    )
-                    send_discord(msg, 0x00ff00 if side_now=="BUY" else 0xff3333)
-
-                    orchestrator.mark_symbol_active(symbol)
-
-        # （pos_latestを取り直す。昇格後の状態で判断したい）
-        pos_now = position_manager.get_position(symbol)
-
-        # --------- (B) AIによる出口判定 ---------
-        wants_exit, exit_info = ai_exit_logic.should_exit_now(pos_now)
+        # ===== AI出口判定 =====
+        wants_exit, exit_info = ai_exit_logic.should_exit_now(pos_before)
         if wants_exit and exit_info:
-            exit_type, exit_price = exit_info  # "AI_TP"とか, 決済価格
+            exit_type, exit_price = exit_info  # e.g. ("AI_TP", 3050.5)
 
+            # クローズ処理（学習ログにも保存される）
             closed_pos = position_manager.force_close(
                 symbol,
                 reason=exit_type,
@@ -215,7 +233,7 @@ def webhook():
 
             orchestrator.mark_symbol_closed(symbol)
 
-            # Discord通知もAI用の文面
+            # Discord通知
             if exit_type == "AI_TP":
                 kind_label = "AI利確🎯"
                 color = 0x33ccff
@@ -235,12 +253,23 @@ def webhook():
             )
             send_discord(msg, color)
 
+            # ★ここでログ行を追加（EXITとして記録）
+            append_trade_log({
+                "timestamp": jst_now().isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "side": closed_pos.get("side", side),
+                "entry_price": closed_pos.get("entry_price", ""),
+                "exit_price": exit_price,
+                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
+                "reason": exit_type,
+            })
+
         return jsonify({"status": "ok"})
 
-    # ============================================================
-    # 3) TP / SL / TIMEOUT : Pine側の保険エグジット
-    #    → まだ閉じてないならここで閉める
-    # ============================================================
+    # ==========================
+    # 3) TP / SL / TIMEOUT
+    #    Pine側の保険エグジット
+    # ==========================
     elif event_type in ["TP", "SL", "TIMEOUT"]:
         closed_pos = position_manager.force_close(
             symbol,
@@ -251,9 +280,9 @@ def webhook():
 
         orchestrator.mark_symbol_closed(symbol)
 
-        # すでにAIで閉じてた場合（close_reasonがAI_で始まる）はもうDiscord報告済なので二重通知しない
-        already_ai = closed_pos and str(closed_pos.get("close_reason", "")).startswith("AI_")
+        already_ai = closed_pos and closed_pos.get("close_reason","").startswith("AI_")
         if not already_ai:
+            # 通知内容
             if event_type == "TP":
                 kind_label = "利確🎯"
                 color = 0x33ccff
@@ -273,16 +302,26 @@ def webhook():
             )
             send_discord(msg, color)
 
+            # ★ここでログ行を追加（EXITとして記録）
+            append_trade_log({
+                "timestamp": jst_now().isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "side": closed_pos.get("side", side) if closed_pos else side,
+                "entry_price": closed_pos.get("entry_price", "") if closed_pos else "",
+                "exit_price": price_now,
+                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
+                "reason": event_type,
+            })
+
         return jsonify({"status": "ok"})
 
-    # ============================================================
-    # それ以外
-    # ============================================================
+    # ==========================
+    # その他
+    # ==========================
     else:
-        print(f"[INFO] 未対応イベント {event_type} payload={payload}")
+        print(f"[INFO] 未対応event {event_type} payload={payload}")
         return jsonify({"status": "ok", "note": "unhandled"})
 
 
 if __name__ == "__main__":
-    # RenderのStartコマンドがgunicornじゃなくpython単体のとき用
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
