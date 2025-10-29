@@ -1,13 +1,11 @@
 import os
 import csv
 from datetime import datetime, timedelta
-from utils.discord import send_discord
 from utils.time_utils import get_jst_now_str
 
 TRADE_LOG = "data/trade_log.csv"
-REPORT_HOOK = os.getenv("DISCORD_WEBHOOK_REPORT", "")
 
-def load_trades():
+def _load_trades():
     rows = []
     if not os.path.exists(TRADE_LOG):
         return rows
@@ -17,58 +15,62 @@ def load_trades():
             rows.append(r)
     return rows
 
-def parse_iso(ts):
-    # trade_log.csv に入ったtimestampを雑にパース
+def _parse_iso(ts):
+    # "2025-10-29T09:00:00+09:00" みたいなの or "2025-10-29T00:00:00"
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except Exception:
+        # 失敗したらUTC扱いにしておく
         return datetime.utcnow()
 
-def summarize_trades(rows, since_dt):
+def _summarize(rows, hours_back):
+    since_dt = datetime.utcnow() - timedelta(hours=hours_back)
+
     picked = []
     for r in rows:
-        t = parse_iso(r["timestamp"])
+        t = _parse_iso(r.get("timestamp", ""))
         if t >= since_dt:
             picked.append(r)
 
     total_cnt = len(picked)
-    total_pnl = 0.0
     win_cnt = 0
+    pnl_sum = 0.0
+
+    detail_lines = []
 
     for r in picked:
-        pnl_val = float(r.get("pnl", 0.0))
-        total_pnl += pnl_val
+        pnl_pct = r.get("pnl_pct", "")
+        try:
+            pnl_val = float(pnl_pct) if pnl_pct != "" else 0.0
+        except:
+            pnl_val = 0.0
+
+        pnl_sum += pnl_val
         if pnl_val > 0:
             win_cnt += 1
 
-    win_rate = (win_cnt / total_cnt * 100.0) if total_cnt > 0 else 0.0
-
-    # 直近20件だけ詳細
-    detail_lines = []
-    for r in picked[:20]:
         detail_lines.append(
-            f"{r['timestamp']} {r['symbol']} {r['side']} "
-            f"IN:{r['entry_price']} -> OUT:{r.get('exit_price','-')} "
-            f"{r.get('reason','?')} pnl:{r.get('pnl','0')}"
+            f"{r.get('timestamp','?')} {r.get('symbol','?')} {r.get('side','?')} "
+            f"IN:{r.get('entry_price','-')} -> OUT:{r.get('exit_price','-')} "
+            f"{r.get('reason','?')} PnL%:{pnl_pct}"
         )
 
-    return total_cnt, total_pnl, win_rate, "\n".join(detail_lines)
+    win_rate = (win_cnt / total_cnt * 100.0) if total_cnt > 0 else 0.0
 
-def build_report(title, hours_back):
-    rows = load_trades()
-    since_dt = datetime.utcnow() - timedelta(hours=hours_back)
-    total_cnt, total_pnl, win_rate, details = summarize_trades(rows, since_dt)
+    return total_cnt, pnl_sum, win_rate, "\n".join(detail_lines[:20])
+
+def generate_daily_report():
+    rows = _load_trades()
+    total_cnt, pnl_sum, win_rate, details = _summarize(rows, hours_back=24)
 
     msg = (
-        f"📊 {title}\n"
+        "📊 デイリーレポート\n"
         f"集計時刻(JST): {get_jst_now_str()}\n"
         f"取引回数: {total_cnt}\n"
-        f"合計損益(円ベース想定): {total_pnl:.2f}\n"
+        f"平均損益率合計(ざっくり%合計): {pnl_sum:.2f}%\n"
         f"勝率: {win_rate:.2f}%\n"
-        f"\n--- 最近のトレード ---\n"
+        "\n--- 最近のトレード(最大20件) ---\n"
         f"{details}\n"
     )
-    return msg
 
-# このファイルを直接cronから叩かない前提。
-# 実際の呼び出しは run_reports.py にまとめてある。
+    return msg
