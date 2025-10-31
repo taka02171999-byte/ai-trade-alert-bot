@@ -1,3 +1,4 @@
+# server.py
 # ===============================
 # TradingView Webhook -> Discord通知（日本語銘柄名対応）
 # 通知は「本エントリー＆その後のAI決済のみ」
@@ -10,7 +11,7 @@ from flask import Flask, request, jsonify
 from datetime import datetime, timezone, timedelta
 import os, json, requests, csv
 
-# あなたの既存モジュール（そのまま利用）
+# 既存モジュール
 import ai_entry_logic
 import ai_exit_logic
 import position_manager
@@ -19,7 +20,7 @@ import orchestrator  # active_symbols など
 JST = timezone(timedelta(hours=9))
 app = Flask(__name__)
 
-# ---- 環境変数
+# ----- 環境変数
 SECRET_TOKEN = os.getenv("TV_SHARED_SECRET", "super_secret_token_please_match")
 
 # メイン通知（必須）
@@ -28,8 +29,10 @@ DISCORD_WEBHOOK_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
 # 取引ログ
 TRADE_LOG_PATH = "data/trade_log.csv"
 
-# 昇格を許す時間（分）: “本気足→次の足の5分間だけ”に相当
-PROMOTION_WINDOW_MIN = float(os.getenv("PROMOTION_WINDOW_MIN", "5"))
+# 環境変数名の揺れ対策（どちらでもOKにする）
+PROMOTION_WINDOW_MIN = float(
+    os.getenv("PROMOTION_WINDOW_MIN", os.getenv("AI_PROMOTE_WINDOW_MIN", "5"))
+)
 
 # ---- 日本語銘柄名マップ
 SYMBOL_NAMES_PATH = "data/symbol_names.json"
@@ -90,7 +93,8 @@ def append_trade_log(row: dict):
     with open(TRADE_LOG_PATH, "a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["timestamp", "symbol", "side", "entry_price", "exit_price", "pnl", "reason"],
+            # ← レポータと合わせて 'pnl_pct' に統一
+            fieldnames=["timestamp", "symbol", "side", "entry_price", "exit_price", "pnl_pct", "reason"],
         )
         if not file_exists:
             writer.writeheader()
@@ -110,14 +114,14 @@ def webhook():
     side       = payload.get("side", "")
     price_now  = float(payload.get("price", 0))
 
-    # 変化率（%）は None も来る想定 → 以後の丸めで落ちないように
+    # 変化率（%）は None も来る想定
     pct_now = payload.get("pct_from_entry")
     try:
         pct_now = float(pct_now) if pct_now is not None else None
     except:
         pct_now = None
 
-    # Pine から来る「エントリー発生ms」（1回目ENTRY時に固定される）※PRICE_TICKほぼ毎回送信
+    # Pine から来る「エントリー発生ms」（PRICE_TICKに添付されがち）
     entry_ts_ms = payload.get("entry_ts")
     try:
         entry_ts_ms = int(entry_ts_ms) if entry_ts_ms is not None else None
@@ -138,7 +142,7 @@ def webhook():
 
         accept, reason = ai_entry_logic.should_accept_entry(
             symbol, side, vol_mult, vwap, atr, last_pct
-        )  # accept: True=real / False, None=shadow
+        )  # accept: True=real / False(None)=shadow
 
         pos_info = position_manager.start_position(
             symbol=symbol,
@@ -149,7 +153,7 @@ def webhook():
 
         orchestrator.mark_symbol_active(symbol)
 
-        # 本採用（real）のみ通知
+        # 本採用（real）のみ通知＆ログ
         if accept:
             msg = (
                 f"🟢エントリー確定\n"
@@ -167,7 +171,7 @@ def webhook():
                 "side": side,
                 "entry_price": price_now,
                 "exit_price": "",
-                "pnl": "",
+                "pnl_pct": "",               # 終値時に入れる
                 "reason": "ENTRY",
             })
 
@@ -203,7 +207,7 @@ def webhook():
 
             within_window = False
             if mins_from_entry is not None:
-                # Pine 側で昼休み補正済みの「経過分」
+                # Pine 側で昼休み補正済の「経過分」
                 within_window = mins_from_entry <= PROMOTION_WINDOW_MIN
             elif entry_ts_ms is not None:
                 # 念のためフォールバック（サーバ時刻とエントリーmsから算出）
@@ -214,7 +218,7 @@ def webhook():
                 # 昇格実行
                 promoted = position_manager.promote_to_real(symbol)
                 if promoted and not promoted.get("closed"):
-                    promote_side = promoted.get("side", side)
+                    promote_side = promoted.get("side", pos_before.get("side", "BUY"))
                     msg = (
                         f"🟢エントリー確定（昇格）\n"
                         f"銘柄: {symbol} {jp_name(symbol)}\n"
@@ -231,7 +235,7 @@ def webhook():
                         "side": promote_side,
                         "entry_price": promoted.get("entry_price", price_now),
                         "exit_price": "",
-                        "pnl": "",
+                        "pnl_pct": "",
                         "reason": "ENTRY",
                     })
 
@@ -247,7 +251,7 @@ def webhook():
 
         wants_exit, exit_info = ai_exit_logic.should_exit_now(pos_before)
         if wants_exit and exit_info:
-            exit_type, exit_price = exit_info  # exit_type: "AI_TP" / "AI_SL" / "AI_TO"
+            exit_type, exit_price = exit_info  # exit_type: "AI_TP" / "AI_SL" / "AI_TIMEOUT"
             closed_pos = position_manager.force_close(
                 symbol, reason=exit_type, price_now=exit_price, pct_now=pct_now
             )
@@ -275,7 +279,7 @@ def webhook():
                 "side": closed_pos.get("side", "") if closed_pos else "",
                 "entry_price": closed_pos.get("entry_price", "") if closed_pos else "",
                 "exit_price": exit_price,
-                "pnl": round(pct_now,2) if pct_now is not None else "",
+                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
                 "reason": exit_type,
             })
 
@@ -285,12 +289,9 @@ def webhook():
     # 3) TP / SL / TIMEOUT  (Pine側の保険決済イベント)
     # ==========================
     elif event_type in ["TP", "SL", "TIMEOUT"]:
-        # 現在のポジ状態を確認して、real 以外は完全スキップ（shadow/未採用は黙殺）
+        # ここでシャドウや未保持は即スキップ（DiscordもCSVも触らない）
         cur = position_manager.get_position(symbol) if hasattr(position_manager, "get_position") else None
-        if not cur or cur.get("closed"):
-            return jsonify({"status": "ok"})
-        if cur.get("status") != "real":
-            # shadowはサイレントで無視
+        if (not cur) or cur.get("closed") or (cur.get("status") != "real"):
             return jsonify({"status": "ok"})
 
         # real で開いている場合のみ「保険」として発火
@@ -324,7 +325,7 @@ def webhook():
                 "side": closed_pos.get("side", "") if closed_pos else "",
                 "entry_price": closed_pos.get("entry_price", "") if closed_pos else "",
                 "exit_price": price_now,
-                "pnl": round(pct_now,2) if pct_now is not None else "",
+                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
                 "reason": event_type,
             })
 
