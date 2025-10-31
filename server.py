@@ -24,8 +24,11 @@ DISCORD_WEBHOOK_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
 
 TRADE_LOG_PATH = "data/trade_log.csv"
 
-# 昇格を許す時間（分）: “本気足→次の足の5分間だけ”に相当
-PROMOTION_WINDOW_MIN = float(os.getenv("PROMOTION_WINDOW_MIN", "5"))
+# 昇格を許す時間（分）:
+#   PROMOTION_WINDOW_MIN が無ければ、過去互換の AI_PROMOTE_WINDOW_MIN を見る（最後は 5 にフォールバック）
+PROMOTION_WINDOW_MIN = float(
+    os.getenv("PROMOTION_WINDOW_MIN", os.getenv("AI_PROMOTE_WINDOW_MIN", "5"))
+)
 
 # ---- 日本語銘柄名マップ
 SYMBOL_NAMES_PATH = "data/symbol_names.json"
@@ -82,16 +85,24 @@ def send_discord(msg: str, color: int = 0x00ccff):
         print("FAILED MSG >>>", msg)
 
 def append_trade_log(row: dict):
+    """
+    レポート系（weekly/monthly）が参照する列名に合わせて 'pnl_pct' を出力する。
+    """
     os.makedirs("data", exist_ok=True)
     file_exists = os.path.exists(TRADE_LOG_PATH)
     with open(TRADE_LOG_PATH, "a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["timestamp","symbol","side","entry_price","exit_price","pnl","reason"],
+            fieldnames=["timestamp","symbol","side","entry_price","exit_price","pnl_pct","reason"],
         )
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+# ---- health check
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "now": jst_now_str()})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -99,44 +110,76 @@ def webhook():
     if not payload:
         return jsonify({"status": "error", "reason": "no data"}), 400
 
-    if payload.get("secret") != SECRET_TOKEN:
+    if (payload.get("secret") or "").strip() != SECRET_TOKEN:
         return jsonify({"status": "error", "reason": "invalid secret"}), 403
 
-    event_type = payload.get("type", "")
-    symbol     = payload.get("symbol", "")
-    side       = payload.get("side", "")
-    price_now  = float(payload.get("price", 0))
-    pct_now    = payload.get("pct_from_entry")
-    if pct_now is not None:
-        try:
-            pct_now = float(pct_now)
-        except:
-            pct_now = None
+    # 受信値の正規化
+    raw_event_type = (payload.get("type", "") or "").strip()
+    etype = raw_event_type.upper()
+    alias = {
+        "ENTRY_BUY_NOW": "ENTRY_BUY",
+        "ENTRY_SELL_NOW": "ENTRY_SELL",
+        "BUY_ENTRY": "ENTRY_BUY",
+        "SELL_ENTRY": "ENTRY_SELL",
+        "TICK": "PRICE_TICK",
+        "PRICEFOLLOW": "PRICE_TICK",
+        "FOLLOW_TICK": "PRICE_TICK",
+        "STEP_UP": "PRICE_TICK",
+        "STEP_DOWN": "PRICE_TICK",
+    }
+    etype = alias.get(etype, etype)
 
-    # Pine から来る「エントリー発生ms」（1回目ENTRY時に固定される）
-    # PRICE_TICKで毎回送られてくる
+    symbol = (payload.get("symbol", "") or "").strip()
+
+    side = (payload.get("side", "") or "").strip().upper()
+    if side in ("LONG", "BUY_SIGNAL"):
+        side = "BUY"
+    elif side in ("SHORT", "SELL_SIGNAL"):
+        side = "SELL"
+
+    # 数値系は安全にパース
+    price_now = payload.get("price", 0)
+    try:
+        price_now = float(price_now)
+    except Exception:
+        price_now = 0.0
+
+    pct_now = payload.get("pct_from_entry")
+    try:
+        pct_now = float(pct_now) if pct_now is not None else None
+    except Exception:
+        pct_now = None
+
+    # Pine から来る「エントリー発生ms」
     entry_ts_ms = payload.get("entry_ts")
     try:
         entry_ts_ms = int(entry_ts_ms) if entry_ts_ms is not None else None
-    except:
+    except Exception:
         entry_ts_ms = None
 
-    print(f"[WEBHOOK] {event_type} {symbol} {side} {price_now} pct={pct_now} at {jst_now_str()}")
+    print(f"[WEBHOOK] etype={etype} raw={raw_event_type} {symbol} {side} {price_now} pct={pct_now} at {jst_now_str()}")
 
     # ==========================
     # 1) ENTRY_BUY / ENTRY_SELL
     # ==========================
-    if event_type in ["ENTRY_BUY", "ENTRY_SELL"]:
-        vol_mult  = float(payload.get("vol_mult", 1.0))
-        vwap      = float(payload.get("vwap", 0.0))
-        atr       = float(payload.get("atr", 0.0))
-        last_pct  = float(payload.get("last_pct", 0.0))
+    if etype in ["ENTRY_BUY", "ENTRY_SELL"]:
+        # Pineから来る文脈値
+        def _to_float(v, default=0.0):
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        vol_mult = _to_float(payload.get("vol_mult", 1.0), 1.0)
+        vwap     = _to_float(payload.get("vwap", 0.0), 0.0)
+        atr      = _to_float(payload.get("atr", 0.0), 0.0)
+        last_pct = _to_float(payload.get("last_pct", 0.0), 0.0)
 
         accept, reason = ai_entry_logic.should_accept_entry(
             symbol, side, vol_mult, vwap, atr, last_pct
         )
 
-        pos_info = position_manager.start_position(
+        _ = position_manager.start_position(
             symbol=symbol,
             side=side,
             price=price_now,
@@ -162,7 +205,7 @@ def webhook():
                 "side": side,
                 "entry_price": price_now,
                 "exit_price": "",
-                "pnl": "",
+                "pnl_pct": "",
                 "reason": "ENTRY",
             })
 
@@ -172,7 +215,7 @@ def webhook():
     # ==========================
     # 2) PRICE_TICK
     # ==========================
-    elif event_type == "PRICE_TICK":
+    elif etype == "PRICE_TICK":
         tick = {
             "t": datetime.now(JST).isoformat(timespec="seconds"),
             "price": price_now,
@@ -193,7 +236,7 @@ def webhook():
             mins_from_entry = tick.get("mins_from_entry")
             try:
                 mins_from_entry = float(mins_from_entry) if mins_from_entry is not None else None
-            except:
+            except Exception:
                 mins_from_entry = None
 
             within_window = False
@@ -227,7 +270,7 @@ def webhook():
                         "side": promote_side,
                         "entry_price": promoted.get("entry_price", price_now),
                         "exit_price": "",
-                        "pnl": "",
+                        "pnl_pct": "",
                         "reason": "ENTRY",
                     })
 
@@ -273,7 +316,7 @@ def webhook():
                 "side": closed_pos.get("side", ""),
                 "entry_price": closed_pos.get("entry_price", ""),
                 "exit_price": exit_price,
-                "pnl": round(pct_now,2) if pct_now is not None else "",
+                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
                 "reason": exit_type,
             })
 
@@ -282,17 +325,17 @@ def webhook():
     # ==========================
     # 3) TP / SL / TIMEOUT  (Pine側の保険決済イベント)
     # ==========================
-    elif event_type in ["TP", "SL", "TIMEOUT"]:
+    elif etype in ["TP", "SL", "TIMEOUT"]:
         closed_pos = position_manager.force_close(
-            symbol, reason=event_type, price_now=price_now, pct_now=pct_now
+            symbol, reason=etype, price_now=price_now, pct_now=pct_now
         )
         orchestrator.mark_symbol_closed(symbol)
 
-        already_ai = closed_pos and closed_pos.get("close_reason","").startswith("AI_")
+        already_ai = closed_pos and str(closed_pos.get("close_reason","")).startswith("AI_")
         if not already_ai:
-            if event_type == "TP":
+            if etype == "TP":
                 kind_label = "利確🎯"; color = 0x33ccff
-            elif event_type == "SL":
+            elif etype == "SL":
                 kind_label = "損切り⚡"; color = 0xff6666
             else:
                 kind_label = "タイムアウト⏱"; color = 0xcccc00
@@ -312,14 +355,15 @@ def webhook():
                 "side": closed_pos.get("side", "") if closed_pos else "",
                 "entry_price": closed_pos.get("entry_price", "") if closed_pos else "",
                 "exit_price": price_now,
-                "pnl": round(pct_now,2) if pct_now is not None else "",
-                "reason": event_type,
+                "pnl_pct": round(pct_now,2) if pct_now is not None else "",
+                "reason": etype,
             })
 
         return jsonify({"status": "ok"})
 
     else:
-        print(f"[INFO] 未対応event {event_type} payload={payload}")
+        known = ["ENTRY_BUY","ENTRY_SELL","PRICE_TICK","TP","SL","TIMEOUT"]
+        print(f"[INFO] 未対応event etype={etype} (raw={raw_event_type}) known={known} payload={payload}")
         return jsonify({"status": "ok", "note": "unhandled"})
 
 if __name__ == "__main__":
