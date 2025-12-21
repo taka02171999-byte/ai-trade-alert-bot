@@ -1,41 +1,24 @@
-# run_reports_weekly.py
-# ==========================================
-# 週次レポ専用（例: 土曜の朝だけCronで叩く）
-#
-# やること:
-#   1. 週次レポをDiscordへ送信
-#
-# 環境変数:
-#   DISCORD_WEBHOOK_REPORT
-# ==========================================
-
 import os
-from datetime import datetime
-import pytz
-
-from report_weekly import generate_weekly_report
 from utils.discord import send_discord
-
+from utils.time_utils import jst_now, is_business_day
+from report_weekly import generate_weekly_report
 
 def main():
-    JST = pytz.timezone("Asia/Tokyo")
-    now_jst = datetime.now(JST)
-
     hook = os.getenv("DISCORD_WEBHOOK_REPORT", "")
+    now = jst_now()
 
-    # 週次レポ
-    try:
-        weekly_msg = generate_weekly_report()
-    except Exception as e:
-        weekly_msg = f"⚠ 週次レポ生成中にエラー: {e}"
-        print("[run_reports_weekly] 週次レポエラー:", e)
+    # 土日祝は送らない
+    if not is_business_day(now):
+        print("[weekly] skip (weekend/holiday):", now)
+        return
 
-    if hook:
-        send_discord(hook, weekly_msg)
-    else:
-        print("[run_reports_weekly] ⚠ DISCORD_WEBHOOK_REPORT 未設定(weekly)")
-        print(weekly_msg)
+    # 金曜のみ送る（Render側スケジュールが金曜でも、二重保険で入れる）
+    if now.weekday() != 4:
+        print("[weekly] skip (not Friday):", now)
+        return
 
+    msg = generate_weekly_report()
+    send_discord(hook, "AIりんご式 週次レポ", msg, 0x00CCFF)
 
 if __name__ == "__main__":
     main()
