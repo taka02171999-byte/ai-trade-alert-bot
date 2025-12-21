@@ -1,184 +1,306 @@
+# server.py
+# ==========================================
+# TradingView Webhook -> Discord通知 + 取引ログ保存（AI判断なし）
+#
+# Pine(JSON) から来るイベント:
+#   ENTRY / HALF_TP / FULL_TP / STOP / TIMEOUT
+#
+# 受け取る主なキー:
+#   secret, event, session(AM/PM), side(LONG/SHORT), ticker, name, price, pct_from_entry(任意)
+#
+# ルール:
+# - サーバは一切判断しない（AIなし）
+# - ENTRYでポジ開始
+# - HALF_TPでhalf_pctを保存
+# - FULL_TP/STOP/TIMEOUTでクローズし、合算pnl%を trade_log.csv に1行保存
+#     realized_pct = 0.5*half_pct + 0.5*final_pct （halfが無いなら final_pct）
+# ==========================================
+
 from flask import Flask, request, jsonify
+from datetime import datetime, timezone, timedelta, date
 import os
 import json
+import csv
+import requests
 
-from utils.discord import send_discord
-from utils.time_utils import get_jst_now_str, jst_now, session_from_time
-import trade_store
-
+JST = timezone(timedelta(hours=9))
 app = Flask(__name__)
 
+# ---- ENV
 SECRET_TOKEN = os.getenv("TV_SHARED_SECRET", "super_secret_token_please_match")
 DISCORD_WEBHOOK_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
-DISCORD_USE_JP_NAMES = os.getenv("DISCORD_USE_JP_NAMES", "true").lower() == "true"
+TRADE_LOG_PATH = "data/trade_log.csv"
+STATE_PATH = "data/positions_state.json"
 
-SYMBOL_NAMES_PATH = "data/symbol_names.json"
-if os.path.exists(SYMBOL_NAMES_PATH):
-    with open(SYMBOL_NAMES_PATH, "r", encoding="utf-8") as f:
-        SYMBOL_NAMES = json.load(f)
-else:
-    SYMBOL_NAMES = {}
 
-def jp_name(symbol: str) -> str:
-    if not symbol:
-        return symbol
-    up = symbol.upper()
-    cands = {symbol, up}
-    if not up.endswith(".T"):
-        cands.add(up + ".T")
-    else:
-        cands.add(up[:-2])
-    digits = "".join(ch for ch in up if ch.isalnum())
-    if digits:
-        cands.add(digits)
-    for k in cands:
-        if k in SYMBOL_NAMES:
-            return SYMBOL_NAMES[k]
-    return symbol
+# --------------------
+# utils
+# --------------------
+def jst_now() -> datetime:
+    return datetime.now(JST)
 
-def resolve_name(symbol: str) -> str:
-    return jp_name(symbol) if DISCORD_USE_JP_NAMES else symbol
+def jst_now_str() -> str:
+    return jst_now().strftime("%Y/%m/%d %H:%M:%S")
 
-def _num(v):
+def _safe_float(x, default=None):
     try:
-        return float(v)
+        if x is None:
+            return default
+        return float(x)
     except Exception:
+        return default
+
+def _side_to_buy_sell(side_str: str) -> str:
+    # Pine: LONG/SHORT
+    s = (side_str or "").upper()
+    if s == "LONG":
+        return "BUY"
+    if s == "SHORT":
+        return "SELL"
+    # 互換: BUY/SELL が来てもそのまま
+    if s in ("BUY", "SELL"):
+        return s
+    return s or "BUY"
+
+def _calc_pct_from_entry(entry_price: float, now_price: float, side_buy_sell: str):
+    if not entry_price or entry_price == 0 or now_price is None:
         return None
+    raw = (now_price / entry_price - 1.0) * 100.0
+    # BUY:そのまま、SELL:符号反転
+    if side_buy_sell == "SELL":
+        raw *= -1.0
+    return raw
 
-def _color_for_event(event_type: str, side: str = "") -> int:
-    if event_type.startswith("ENTRY"):
-        return 0x00FF00 if side == "BUY" else 0xFF3333
-    if event_type == "HALF_TP":
-        return 0x33CCFF
-    if event_type == "FULL_TP":
-        return 0x33CCFF
-    if event_type == "STOP":
-        return 0xFF6666
-    if event_type == "TIMEOUT":
-        return 0xCCCC00
-    return 0x00CCFF
+def _load_state():
+    if not os.path.exists(STATE_PATH):
+        return {}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+def _save_state(state: dict):
+    os.makedirs("data", exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
+def _pos_key(session: str, ticker: str) -> str:
+    # 同一銘柄がAM/PMで別ポジになり得るので分ける
+    return f"{(session or '').upper()}::{(ticker or '').upper()}"
+
+def send_discord(msg: str, color: int = 0x00ccff):
+    if not DISCORD_WEBHOOK_MAIN:
+        print("⚠ DISCORD_WEBHOOK_MAIN 未設定\n", msg)
+        return
+
+    data = {
+        "embeds": [
+            {
+                "title": "AIりんご式トレード通知",
+                "description": msg,
+                "color": color,
+                "footer": {"text": "AIりんご式 | " + jst_now_str()},
+            }
+        ]
+    }
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_MAIN, json=data, timeout=7)
+        print(f"[Discord] status={resp.status_code}")
+    except Exception as e:
+        print(f"[Discord] 送信エラー: {e}\nFAILED MSG >>> {msg}")
+
+def append_trade_log(row: dict):
+    """
+    report_*.py が読んでる data/trade_log.csv に「1トレード=1行」で保存
+    既存レポート互換のため fieldnames は固定（増やさない）
+    """
+    os.makedirs("data", exist_ok=True)
+    file_exists = os.path.exists(TRADE_LOG_PATH)
+
+    fieldnames = ["timestamp", "symbol", "side", "entry_price", "exit_price", "pnl_pct", "reason"]
+
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": row.get("timestamp", ""),
+            "symbol": row.get("symbol", ""),
+            "side": row.get("side", ""),
+            "entry_price": row.get("entry_price", ""),
+            "exit_price": row.get("exit_price", ""),
+            "pnl_pct": row.get("pnl_pct", ""),
+            "reason": row.get("reason", ""),
+        })
+
+
+# --------------------
+# main webhook
+# --------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.get_json(silent=True)
     if not payload:
-        return jsonify({"status": "error", "reason": "no json"}), 400
+        return jsonify({"status": "error", "reason": "no data"}), 400
 
+    # secret check
     if payload.get("secret") != SECRET_TOKEN:
         return jsonify({"status": "error", "reason": "invalid secret"}), 403
 
-    event_type = payload.get("type", "")
-    symbol = payload.get("symbol", "")
-    side = payload.get("side", "")  # BUY / SELL
-    price = _num(payload.get("price"))
-    pct_from_entry = _num(payload.get("pct_from_entry"))
+    # Pine形式優先（event/ticker/side=LONG|SHORT/priceは文字列でもOK）
+    event_type = (payload.get("event") or payload.get("type") or "").upper()
+    session = (payload.get("session") or "").upper()
+    ticker = payload.get("ticker") or payload.get("symbol") or ""
+    name = payload.get("name") or ""
+    side_raw = payload.get("side") or ""
+    side = _side_to_buy_sell(side_raw)
 
-    # セッション：Pineが送ってくるならそれ優先。無ければJST時刻から推定
-    session = payload.get("session")
-    if not session:
-        session = session_from_time(jst_now())
-    session = str(session).upper()
+    price_now = _safe_float(payload.get("price"), default=0.0)
+    pct_now = _safe_float(payload.get("pct_from_entry"), default=None)
 
-    name = resolve_name(symbol)
+    if not ticker or not event_type:
+        return jsonify({"status": "error", "reason": "missing ticker/event"}), 400
 
-    if price is None:
-        return jsonify({"status": "error", "reason": "price missing"}), 400
+    key = _pos_key(session, ticker)
+    state = _load_state()
+    pos = state.get(key)
 
-    # --------------- ENTRY ---------------
-    if event_type in ["ENTRY", "ENTRY_BUY", "ENTRY_SELL"]:
-        # sideの補正（ENTRY_BUY/ENTRY_SELL も対応）
-        if event_type == "ENTRY_BUY":
-            side = "BUY"
-        elif event_type == "ENTRY_SELL":
-            side = "SELL"
+    print(f"[WEBHOOK] {event_type} {session} {ticker} {side_raw}->{side} price={price_now} pct={pct_now} at {jst_now_str()}")
 
-        if side not in ["BUY", "SELL"]:
-            return jsonify({"status": "error", "reason": "side missing"}), 400
+    # --------------------
+    # ENTRY
+    # --------------------
+    if event_type == "ENTRY":
+        # すでに未クローズがあるなら二重ENTRY防止（何もしない）
+        if pos and not pos.get("closed", False):
+            return jsonify({"status": "ok", "note": "already in position"})
 
-        # すでにオープンがあるなら上書きしない（2重ENTRYを防ぐ）
-        existing = trade_store.get_open(symbol)
-        if existing:
-            return jsonify({"status": "ok", "note": "already_open"})
+        state[key] = {
+            "session": session,
+            "ticker": ticker,
+            "name": name,
+            "side": side,  # BUY/SELL
+            "entry_price": price_now,
+            "entry_time": jst_now().isoformat(timespec="seconds"),
+            "half_done": False,
+            "half_pct": None,
+            "closed": False,
+            "close_time": None,
+            "close_reason": None,
+            "exit_price": None,
+            "final_pct": None,
+        }
+        _save_state(state)
 
-        pos = trade_store.start_entry(
-            symbol=symbol,
-            name=name,
-            side=side,
-            session=session,
-            price=price,
-            pct_from_entry=pct_from_entry,
-        )
-
-        desc = (
+        color = 0x00ff00 if side == "BUY" else 0xff3333
+        msg = (
             f"🟢 ENTRY\n"
-            f"銘柄: {symbol} ({name})\n"
-            f"方向: {'買い' if side=='BUY' else '売り'}\n"
-            f"価格: {price}\n"
-            f"セッション: {session}\n"
-            f"時刻: {get_jst_now_str()}\n"
+            f"Session: {session}\n"
+            f"銘柄: {ticker} {name}\n"
+            f"方向: {'買い(LONG)' if side=='BUY' else '売り(SHORT)'}\n"
+            f"価格: {price_now}\n"
+            f"時刻: {jst_now_str()}"
         )
-        send_discord(DISCORD_WEBHOOK_MAIN, "AIりんご式トレード通知", desc, _color_for_event("ENTRY", side))
-        return jsonify({"status": "ok", "trade_id": pos.get("trade_id")})
+        send_discord(msg, color)
+        return jsonify({"status": "ok"})
 
-    # --------------- HALF_TP ---------------
-    if event_type in ["HALF_TP", "TP_HALF"]:
-        pos = trade_store.get_open(symbol)
-        if not pos:
-            return jsonify({"status": "ok", "note": "no_open"})
+    # --------------------
+    # HALF_TP
+    # --------------------
+    if event_type == "HALF_TP":
+        if not pos or pos.get("closed"):
+            return jsonify({"status": "ok", "note": "no active position"})
 
-        updated = trade_store.mark_half_tp(symbol, price=price, pct_from_entry=pct_from_entry)
+        if pos.get("half_done"):
+            return jsonify({"status": "ok", "note": "half already done"})
 
-        desc = (
-            f"🔷 HALF_TP（半分利確）\n"
-            f"銘柄: {symbol} ({name})\n"
-            f"価格: {price}\n"
-            f"エントリー比: {pct_from_entry if pct_from_entry is not None else '---'}%\n"
-            f"セッション: {pos.get('session','')}\n"
-            f"時刻: {get_jst_now_str()}\n"
+        # pctが無いなら計算
+        if pct_now is None:
+            pct_now = _calc_pct_from_entry(_safe_float(pos.get("entry_price"), 0.0), price_now, pos.get("side"))
+
+        pos["half_done"] = True
+        pos["half_pct"] = pct_now
+        state[key] = pos
+        _save_state(state)
+
+        msg = (
+            f"🟠 HALF_TP（半分利確）\n"
+            f"Session: {pos.get('session','')}\n"
+            f"銘柄: {pos.get('ticker','')} {pos.get('name','')}\n"
+            f"価格: {price_now}\n"
+            f"半利確時点%: {round(pct_now,2) if pct_now is not None else '---'}%\n"
+            f"時刻: {jst_now_str()}"
         )
-        send_discord(DISCORD_WEBHOOK_MAIN, "AIりんご式トレード通知", desc, _color_for_event("HALF_TP", pos.get("side","")))
-        return jsonify({"status": "ok", "note": "half_marked" if updated else "ignored"})
+        send_discord(msg, 0xffaa33)
+        return jsonify({"status": "ok"})
 
-    # --------------- CLOSE系 ---------------
-    if event_type in ["FULL_TP", "TP", "STOP", "SL", "TIMEOUT"]:
-        # 正規化
-        if event_type == "TP":
-            event_type = "FULL_TP"
-        if event_type == "SL":
-            event_type = "STOP"
+    # --------------------
+    # CLOSE EVENTS: FULL_TP / STOP / TIMEOUT
+    # --------------------
+    if event_type in ("FULL_TP", "STOP", "TIMEOUT"):
+        if not pos or pos.get("closed"):
+            return jsonify({"status": "ok", "note": "no active position"})
 
-        pos = trade_store.get_open(symbol)
-        if not pos:
-            return jsonify({"status": "ok", "note": "no_open"})
+        # pctが無いなら計算
+        if pct_now is None:
+            pct_now = _calc_pct_from_entry(_safe_float(pos.get("entry_price"), 0.0), price_now, pos.get("side"))
 
-        closed = trade_store.close_position(
-            symbol=symbol,
-            exit_reason=event_type,
-            price=price,
-            pct_from_entry=pct_from_entry,
+        half_done = bool(pos.get("half_done", False))
+        half_pct = _safe_float(pos.get("half_pct"), default=None)
+        final_pct = pct_now
+
+        # 合算
+        if half_done and (half_pct is not None) and (final_pct is not None):
+            realized = 0.5 * half_pct + 0.5 * final_pct
+        else:
+            realized = final_pct
+
+        pos["closed"] = True
+        pos["close_time"] = jst_now().isoformat(timespec="seconds")
+        pos["close_reason"] = event_type
+        pos["exit_price"] = price_now
+        pos["final_pct"] = final_pct
+        state[key] = pos
+        _save_state(state)
+
+        # Discord
+        if event_type == "FULL_TP":
+            label, color = "🟦 FULL_TP（全利確）", 0x33ccff
+        elif event_type == "STOP":
+            label, color = "🟥 STOP（損切り）", 0xff6666
+        else:
+            label, color = "🟨 TIMEOUT（時間切れ）", 0xcccc00
+
+        msg = (
+            f"{label}\n"
+            f"Session: {pos.get('session','')}\n"
+            f"銘柄: {pos.get('ticker','')} {pos.get('name','')}\n"
+            f"決済価格: {price_now}\n"
+            f"最終%: {round(final_pct,2) if final_pct is not None else '---'}%\n"
+            f"合算%（半+全）: {round(realized,2) if realized is not None else '---'}%\n"
+            f"時刻: {jst_now_str()}"
         )
-        if not closed:
-            return jsonify({"status": "ok", "note": "already_closed"})
+        send_discord(msg, color)
 
-        desc = (
-            f"{'🎯 FULL_TP' if event_type=='FULL_TP' else '⚡ STOP' if event_type=='STOP' else '⏱ TIMEOUT'}\n"
-            f"銘柄: {symbol} ({name})\n"
-            f"決済価格: {price}\n"
-            f"エントリー比: {pct_from_entry if pct_from_entry is not None else '---'}%\n"
-            f"実現損益(合算): {closed.get('realized_pct','---')}%\n"
-            f"セッション: {pos.get('session','')}\n"
-            f"時刻: {get_jst_now_str()}\n"
-        )
-        send_discord(DISCORD_WEBHOOK_MAIN, "AIりんご式トレード通知", desc, _color_for_event(event_type, pos.get("side","")))
-        return jsonify({"status": "ok", "realized_pct": closed.get("realized_pct", "")})
+        # CSV（既存レポ互換のため 1行=1トレード）
+        append_trade_log({
+            "timestamp": jst_now().isoformat(timespec="seconds"),
+            "symbol": pos.get("ticker", ""),
+            "side": pos.get("side", ""),
+            "entry_price": pos.get("entry_price", ""),
+            "exit_price": price_now,
+            "pnl_pct": round(realized, 2) if realized is not None else "",
+            "reason": f"{pos.get('session','')}_{event_type}",
+        })
 
-    # --------------- 未対応 ---------------
-    return jsonify({"status": "ok", "note": f"unhandled:{event_type}"})
-    
+        return jsonify({"status": "ok"})
+
+    # --------------------
+    # unhandled
+    # --------------------
+    return jsonify({"status": "ok", "note": "unhandled event"})
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
