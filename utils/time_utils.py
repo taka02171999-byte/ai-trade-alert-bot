@@ -1,32 +1,35 @@
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone, timedelta
+import jpholiday
 
-JST = pytz.timezone("Asia/Tokyo")
+JST = timezone(timedelta(hours=9))
 
-def get_jst_now():
+def jst_now() -> datetime:
     return datetime.now(JST)
 
-def get_jst_now_str():
-    # "2025-10-26T09:41:00+09:00" みたいなISO風
-    return get_jst_now().isoformat(timespec="seconds")
+def get_jst_now_str() -> str:
+    return jst_now().strftime("%Y/%m/%d %H:%M:%S")
 
-def is_market_closed_now_jst(market_close_hhmm: str) -> bool:
-    """
-    market_close_hhmm: "15:25" みたいな文字列
-    現在JST時刻がそれ以降なら True
-    """
-    now = get_jst_now()
-    try:
-        hh, mm = market_close_hhmm.split(":")
-        close_h = int(hh)
-        close_m = int(mm)
-    except:
-        close_h = 15
-        close_m = 25
+def is_weekend(dt: datetime) -> bool:
+    # 5=土 6=日
+    return dt.weekday() >= 5
 
-    # すでに引け時刻を過ぎているか
-    if now.hour > close_h:
-        return True
-    if now.hour == close_h and now.minute >= close_m:
-        return True
-    return False
+def is_jp_holiday(dt: datetime) -> bool:
+    # jpholidayはdateを渡す
+    return jpholiday.is_holiday(dt.date())
+
+def is_business_day(dt: datetime) -> bool:
+    return (not is_weekend(dt)) and (not is_jp_holiday(dt))
+
+def session_from_time(dt: datetime) -> str:
+    """
+    payloadにsessionが無い場合の推定。
+    09:00-11:30 => AM
+    12:30-15:30 => PM
+    その他 => OTHER
+    """
+    hhmm = dt.strftime("%H:%M")
+    if "09:00" <= hhmm <= "11:30":
+        return "AM"
+    if "12:30" <= hhmm <= "15:30":
+        return "PM"
+    return "OTHER"
