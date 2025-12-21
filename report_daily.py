@@ -1,76 +1,62 @@
 import os
 import csv
 from datetime import datetime, timedelta
-from utils.time_utils import get_jst_now_str
+from utils.time_utils import jst_now, get_jst_now_str
 
-TRADE_LOG = "data/trade_log.csv"
+TRADES_PATH = "data/trades.csv"
 
 def _load_trades():
-    rows = []
-    if not os.path.exists(TRADE_LOG):
-        return rows
-    with open(TRADE_LOG, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
-    return rows
+    if not os.path.exists(TRADES_PATH):
+        return []
+    with open(TRADES_PATH, "r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
-def _parse_iso(ts):
-    # "2025-10-29T09:00:00+09:00" みたいなの or "2025-10-29T00:00:00"
+def _parse_iso(ts: str):
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)
     except Exception:
-        # 失敗したらUTC扱いにしておく
-        return datetime.utcnow()
-
-def _summarize(rows, hours_back):
-    since_dt = datetime.utcnow() - timedelta(hours=hours_back)
-
-    picked = []
-    for r in rows:
-        t = _parse_iso(r.get("timestamp", ""))
-        if t >= since_dt:
-            picked.append(r)
-
-    total_cnt = len(picked)
-    win_cnt = 0
-    pnl_sum = 0.0
-
-    detail_lines = []
-
-    for r in picked:
-        pnl_pct = r.get("pnl_pct", "")
-        try:
-            pnl_val = float(pnl_pct) if pnl_pct != "" else 0.0
-        except:
-            pnl_val = 0.0
-
-        pnl_sum += pnl_val
-        if pnl_val > 0:
-            win_cnt += 1
-
-        detail_lines.append(
-            f"{r.get('timestamp','?')} {r.get('symbol','?')} {r.get('side','?')} "
-            f"IN:{r.get('entry_price','-')} -> OUT:{r.get('exit_price','-')} "
-            f"{r.get('reason','?')} PnL%:{pnl_pct}"
-        )
-
-    win_rate = (win_cnt / total_cnt * 100.0) if total_cnt > 0 else 0.0
-
-    return total_cnt, pnl_sum, win_rate, "\n".join(detail_lines[:20])
+        return None
 
 def generate_daily_report():
     rows = _load_trades()
-    total_cnt, pnl_sum, win_rate, details = _summarize(rows, hours_back=24)
+    now = jst_now()
+    since = now - timedelta(days=1)
+
+    picked = []
+    for r in rows:
+        t = _parse_iso(r.get("timestamp_exit", ""))
+        if t and t >= since:
+            picked.append(r)
+
+    total = len(picked)
+    pnl_sum = 0.0
+    win = 0
+    lines = []
+
+    for r in picked[-50:]:
+        rp = r.get("realized_pct", "")
+        try:
+            v = float(rp) if rp != "" else 0.0
+        except Exception:
+            v = 0.0
+        pnl_sum += v
+        if v > 0:
+            win += 1
+
+        lines.append(
+            f"{r.get('timestamp_exit','?')} {r.get('symbol','?')} {r.get('side','?')} "
+            f"{r.get('session','?')} realized:{r.get('realized_pct','')}% reason:{r.get('exit_reason','')}"
+        )
+
+    win_rate = (win / total * 100.0) if total else 0.0
 
     msg = (
-        "📊 デイリーレポート\n"
+        "📊 デイリーレポート（直近24h）\n"
         f"集計時刻(JST): {get_jst_now_str()}\n"
-        f"取引回数: {total_cnt}\n"
-        f"平均損益率合計(ざっくり%合計): {pnl_sum:.2f}%\n"
+        f"件数: {total}\n"
+        f"実現損益% 合計: {pnl_sum:.2f}%\n"
         f"勝率: {win_rate:.2f}%\n"
-        "\n--- 最近のトレード(最大20件) ---\n"
-        f"{details}\n"
+        "\n--- 明細（最大50件）---\n"
+        + ("\n".join(lines) if lines else "（対象なし）")
     )
-
     return msg
