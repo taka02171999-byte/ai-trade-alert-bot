@@ -1,22 +1,22 @@
 import requests
 
-def send_discord(webhook_url: str, title: str, description: str, color: int = 0x00CCFF):
-    if not webhook_url:
-        print("⚠ DISCORD webhook未設定:", title, description)
+def send_discord(webhook: str, msg: str):
+    if not webhook:
+        print("⚠ DISCORD_WEBHOOK not set")
         return
 
-    payload = {
+    data = {
         "embeds": [
             {
-                "title": title,
-                "description": description,
-                "color": color,
+                "title": "AIりんご式 レポート",
+                "description": msg,
+                "color": 0x00ccff
             }
         ]
     }
 
     try:
-        r = requests.post(webhook_url, json=payload, timeout=8)
-        print("Discord status:", r.status_code)
+        r = requests.post(webhook, json=data, timeout=10)
+        print(f"[send_discord] status={r.status_code}")
     except Exception as e:
-        print("Discord送信エラー:", e)
+        print(f"[send_discord] error: {e}")
