@@ -40,6 +40,7 @@ def _safe_url(u: str) -> str:
 print("[boot] TV_SHARED_SECRET set =", bool(SECRET_TOKEN))
 print("[boot] DISCORD_WEBHOOK_MAIN =", _safe_url(DISCORD_WEBHOOK_MAIN))
 
+
 # --------------------
 # utils
 # --------------------
@@ -163,6 +164,14 @@ def append_trade_log(row: dict):
 
 
 # --------------------
+# health check（UptimeRobot用）
+# --------------------
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": jst_now_str()})
+
+
+# --------------------
 # main webhook
 # --------------------
 @app.route("/webhook", methods=["POST"])
@@ -173,6 +182,8 @@ def webhook():
 
     # secret check
     if payload.get("secret") != SECRET_TOKEN:
+        # ここが一番多い原因なのでログを出す（secretそのものは出さない）
+        print("[WEBHOOK] invalid secret. got_secret=", bool(payload.get("secret")), "at", jst_now_str())
         return jsonify({"status": "error", "reason": "invalid secret"}), 403
 
     # Pine形式優先（event/ticker/side=LONG|SHORT/priceは文字列でもOK）
@@ -187,6 +198,7 @@ def webhook():
     pct_now = _safe_float(payload.get("pct_from_entry"), default=None)
 
     if not ticker or not event_type:
+        print("[WEBHOOK] missing ticker/event at", jst_now_str(), "payload_keys=", list(payload.keys()))
         return jsonify({"status": "error", "reason": "missing ticker/event"}), 400
 
     key = _pos_key(session, ticker)
@@ -201,6 +213,7 @@ def webhook():
     if event_type == "ENTRY":
         # すでに未クローズがあるなら二重ENTRY防止（何もしない）
         if pos and not pos.get("closed", False):
+            print("[ENTRY] ignored: already in position key=", key)
             return jsonify({"status": "ok", "note": "already in position"})
 
         state[key] = {
@@ -237,9 +250,11 @@ def webhook():
     # --------------------
     if event_type == "HALF_TP":
         if not pos or pos.get("closed"):
+            print("[HALF_TP] no active position key=", key)
             return jsonify({"status": "ok", "note": "no active position"})
 
         if pos.get("half_done"):
+            print("[HALF_TP] ignored: half already done key=", key)
             return jsonify({"status": "ok", "note": "half already done"})
 
         # pctが無いなら計算
@@ -267,6 +282,7 @@ def webhook():
     # --------------------
     if event_type in ("FULL_TP", "STOP", "TIMEOUT"):
         if not pos or pos.get("closed"):
+            print("[CLOSE] no active position key=", key, "event=", event_type)
             return jsonify({"status": "ok", "note": "no active position"})
 
         # pctが無いなら計算
@@ -326,6 +342,7 @@ def webhook():
     # --------------------
     # unhandled
     # --------------------
+    print("[WEBHOOK] unhandled event=", event_type, "key=", key)
     return jsonify({"status": "ok", "note": "unhandled event"})
 
 
