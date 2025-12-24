@@ -1,4 +1,3 @@
-# server.py
 # ==========================================
 # TradingView Webhook -> Discord通知 + 取引ログ保存（AI判断なし）
 #
@@ -17,7 +16,7 @@
 # ==========================================
 
 from flask import Flask, request, jsonify
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 import os
 import json
 import csv
@@ -32,6 +31,14 @@ DISCORD_WEBHOOK_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
 TRADE_LOG_PATH = "data/trade_log.csv"
 STATE_PATH = "data/positions_state.json"
 
+# 起動時に最低限だけ状態をログ（Webhook全文は出さない）
+def _safe_url(u: str) -> str:
+    if not u:
+        return ""
+    return u[:45] + "..." if len(u) > 45 else u
+
+print("[boot] TV_SHARED_SECRET set =", bool(SECRET_TOKEN))
+print("[boot] DISCORD_WEBHOOK_MAIN =", _safe_url(DISCORD_WEBHOOK_MAIN))
 
 # --------------------
 # utils
@@ -90,8 +97,12 @@ def _pos_key(session: str, ticker: str) -> str:
     return f"{(session or '').upper()}::{(ticker or '').upper()}"
 
 def send_discord(msg: str, color: int = 0x00ccff):
+    """
+    ここは挙動を変えず、失敗理由が分かるログだけ強化。
+    Discord webhook成功は 204 が多い。失敗時は本文を出す。
+    """
     if not DISCORD_WEBHOOK_MAIN:
-        print("⚠ DISCORD_WEBHOOK_MAIN 未設定\n", msg)
+        print("⚠ [Discord] DISCORD_WEBHOOK_MAIN 未設定\n", msg)
         return
 
     data = {
@@ -104,11 +115,27 @@ def send_discord(msg: str, color: int = 0x00ccff):
             }
         ]
     }
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "ai-ringo-bot/1.0",
+    }
+
     try:
-        resp = requests.post(DISCORD_WEBHOOK_MAIN, json=data, timeout=7)
-        print(f"[Discord] status={resp.status_code}")
+        resp = requests.post(DISCORD_WEBHOOK_MAIN, json=data, headers=headers, timeout=10)
+
+        ok = (200 <= resp.status_code < 300)
+        print(f"[Discord] status={resp.status_code} ok={ok}")
+
+        if not ok:
+            # 失敗時にDiscordの返答をログに出す（ここが原因）
+            try:
+                print("[Discord] response_text =", resp.text)
+            except Exception:
+                print("[Discord] response_text = <no text>")
+
     except Exception as e:
-        print(f"[Discord] 送信エラー: {e}\nFAILED MSG >>> {msg}")
+        print(f"[Discord] 送信エラー: {type(e).__name__}: {e}\nFAILED MSG >>> {msg}")
 
 def append_trade_log(row: dict):
     """
