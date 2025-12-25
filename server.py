@@ -31,6 +31,25 @@ DISCORD_WEBHOOK_MAIN = os.getenv("DISCORD_WEBHOOK_MAIN", "")
 TRADE_LOG_PATH = "data/trade_log.csv"
 STATE_PATH = "data/positions_state.json"
 
+# ✅ 追加（最小）：レポートが読んでる trades.csv にも書く
+TRADES_PATH = "data/trades.csv"
+TRADES_FIELDS = [
+    "trade_id",
+    "timestamp_entry",
+    "timestamp_exit",
+    "symbol",
+    "name",
+    "side",
+    "session",
+    "entry_price",
+    "half_tp_price",
+    "half_tp_pct",
+    "exit_price",
+    "exit_pct",
+    "realized_pct",
+    "exit_reason",
+]
+
 # 起動時に最低限だけ状態をログ（Webhook全文は出さない）
 def _safe_url(u: str) -> str:
     if not u:
@@ -129,7 +148,6 @@ def send_discord(msg: str, color: int = 0x00ccff):
         print(f"[Discord] status={resp.status_code} ok={ok}")
 
         if not ok:
-            # 失敗時にDiscordの返答をログに出す（ここが原因）
             try:
                 print("[Discord] response_text =", resp.text)
             except Exception:
@@ -162,6 +180,18 @@ def append_trade_log(row: dict):
             "reason": row.get("reason", ""),
         })
 
+# ✅ 追加（最小）：レポート用 trades.csv にも追記（レポートがここを見る）
+def append_trades_csv(row: dict):
+    os.makedirs("data", exist_ok=True)
+    file_exists = os.path.exists(TRADES_PATH)
+
+    with open(TRADES_PATH, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TRADES_FIELDS)
+        if not file_exists:
+            w.writeheader()
+        safe = {k: row.get(k, "") for k in TRADES_FIELDS}
+        w.writerow(safe)
+
 
 # --------------------
 # health check（UptimeRobot用）
@@ -182,7 +212,6 @@ def webhook():
 
     # secret check
     if payload.get("secret") != SECRET_TOKEN:
-        # ここが一番多い原因なのでログを出す（secretそのものは出さない）
         print("[WEBHOOK] invalid secret. got_secret=", bool(payload.get("secret")), "at", jst_now_str())
         return jsonify({"status": "error", "reason": "invalid secret"}), 403
 
@@ -211,7 +240,6 @@ def webhook():
     # ENTRY
     # --------------------
     if event_type == "ENTRY":
-        # すでに未クローズがあるなら二重ENTRY防止（何もしない）
         if pos and not pos.get("closed", False):
             print("[ENTRY] ignored: already in position key=", key)
             return jsonify({"status": "ok", "note": "already in position"})
@@ -257,7 +285,6 @@ def webhook():
             print("[HALF_TP] ignored: half already done key=", key)
             return jsonify({"status": "ok", "note": "half already done"})
 
-        # pctが無いなら計算
         if pct_now is None:
             pct_now = _calc_pct_from_entry(_safe_float(pos.get("entry_price"), 0.0), price_now, pos.get("side"))
 
@@ -285,7 +312,6 @@ def webhook():
             print("[CLOSE] no active position key=", key, "event=", event_type)
             return jsonify({"status": "ok", "note": "no active position"})
 
-        # pctが無いなら計算
         if pct_now is None:
             pct_now = _calc_pct_from_entry(_safe_float(pos.get("entry_price"), 0.0), price_now, pos.get("side"))
 
@@ -293,7 +319,6 @@ def webhook():
         half_pct = _safe_float(pos.get("half_pct"), default=None)
         final_pct = pct_now
 
-        # 合算
         if half_done and (half_pct is not None) and (final_pct is not None):
             realized = 0.5 * half_pct + 0.5 * final_pct
         else:
@@ -307,7 +332,6 @@ def webhook():
         state[key] = pos
         _save_state(state)
 
-        # Discord
         if event_type == "FULL_TP":
             label, color = "🟦 FULL_TP（全利確）", 0x33ccff
         elif event_type == "STOP":
@@ -335,6 +359,26 @@ def webhook():
             "exit_price": price_now,
             "pnl_pct": round(realized, 2) if realized is not None else "",
             "reason": f"{pos.get('session','')}_{event_type}",
+        })
+
+        # ✅ 追加（最小）：レポートが読む trades.csv にも同じトレードを保存
+        # ここで STOP/TIMEOUT も当然入る（exit_reason に反映される）
+        trade_id = f"{pos.get('ticker','')}_{pos.get('entry_time','')}"
+        append_trades_csv({
+            "trade_id": trade_id,
+            "timestamp_entry": pos.get("entry_time", ""),
+            "timestamp_exit": pos.get("close_time", ""),
+            "symbol": pos.get("ticker", ""),
+            "name": pos.get("name", ""),
+            "side": pos.get("side", ""),
+            "session": pos.get("session", ""),
+            "entry_price": pos.get("entry_price", ""),
+            "half_tp_price": "",  # 今の仕様は価格は持ってないので空（pctは保存してる）
+            "half_tp_pct": pos.get("half_pct", "") if pos.get("half_done") else "",
+            "exit_price": price_now,
+            "exit_pct": round(final_pct, 4) if final_pct is not None else "",
+            "realized_pct": round(realized, 4) if realized is not None else "",
+            "exit_reason": f"{pos.get('session','')}_{event_type}",
         })
 
         return jsonify({"status": "ok"})
