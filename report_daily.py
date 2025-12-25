@@ -20,7 +20,9 @@ def _parse_iso(ts: str):
 def generate_daily_report():
     rows = _load_trades()
     now = jst_now()
-    since = now - timedelta(days=1)
+
+    # ✅ 変更点：直近24h → 「当日(JST) 0:00〜現在」だけ集計
+    since = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     picked = []
     for r in rows:
@@ -51,7 +53,7 @@ def generate_daily_report():
     win_rate = (win / total * 100.0) if total else 0.0
 
     msg = (
-        "📊 デイリーレポート（直近24h）\n"
+        "📊 デイリーレポート（当日 0:00〜現在）\n"
         f"集計時刻(JST): {get_jst_now_str()}\n"
         f"件数: {total}\n"
         f"実現損益% 合計: {pnl_sum:.2f}%\n"
