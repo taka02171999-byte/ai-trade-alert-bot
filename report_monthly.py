@@ -3,7 +3,9 @@ import csv
 from datetime import datetime, timedelta
 from utils.time_utils import jst_now, get_jst_now_str
 
-TRADES_PATH = "data/trades.csv"
+# ✅ 最小修正：このファイル位置基準で data/trades.csv を指す（cwd依存を排除）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRADES_PATH = os.path.join(BASE_DIR, "data", "trades.csv")
 
 def _load_trades():
     if not os.path.exists(TRADES_PATH):
