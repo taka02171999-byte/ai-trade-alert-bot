@@ -1,112 +1,66 @@
-# run_reports_daily.py
-# ==========================================
-# 毎営業日用（日次レポ）
-# - 土日祝は送らない
-# - AI学習などは一切しない
-# ==========================================
-
 import os
-from datetime import datetime, timedelta, date
-import pytz
+import csv
+from datetime import datetime
+from utils.time_utils import jst_now, get_jst_now_str
 
-from report_daily import generate_daily_report
-from utils.discord import send_discord
+# ---- ここだけ「最小の本質修正」：このファイルの場所基準で data/trades.csv を読む
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRADES_PATH = os.path.join(BASE_DIR, "data", "trades.csv")
 
+def _load_trades():
+    if not os.path.exists(TRADES_PATH):
+        return []
+    with open(TRADES_PATH, "r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
-# --------------------
-# 日本の祝日判定（外部ライブラリ無し）
-# --------------------
-def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
-    # weekday: Mon=0 ... Sun=6
-    d = date(year, month, 1)
-    # 1日に近いweekdayまで進める
-    while d.weekday() != weekday:
-        d = d + timedelta(days=1)
-    # n回目へ
-    return d + timedelta(days=7 * (n - 1))
+def _parse_iso(ts: str):
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
 
-def _vernal_equinox_day(year: int) -> int:
-    # 近似式（1980-2099程度で実用）
-    return int(20.8431 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
+def generate_daily_report():
+    rows = _load_trades()
+    now = jst_now()
 
-def _autumnal_equinox_day(year: int) -> int:
-    return int(23.2488 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
+    # 当日(JST) 0:00〜現在
+    since = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-def jp_holidays(year: int) -> set:
-    h = set()
+    picked = []
+    for r in rows:
+        t = _parse_iso(r.get("timestamp_exit", ""))
+        if t and t >= since:
+            picked.append(r)
 
-    # 固定日
-    h.add(date(year, 1, 1))   # 元日
-    h.add(date(year, 2, 11))  # 建国記念の日
-    h.add(date(year, 2, 23))  # 天皇誕生日
-    h.add(date(year, 4, 29))  # 昭和の日
-    h.add(date(year, 5, 3))   # 憲法記念日
-    h.add(date(year, 5, 4))   # みどりの日
-    h.add(date(year, 5, 5))   # こどもの日
-    h.add(date(year, 8, 11))  # 山の日
-    h.add(date(year, 11, 3))  # 文化の日
-    h.add(date(year, 11, 23)) # 勤労感謝の日
+    total = len(picked)
+    pnl_sum = 0.0
+    win = 0
+    lines = []
 
-    # ハッピーマンデー
-    h.add(_nth_weekday(year, 1, 0, 2))   # 成人の日: 1月第2月曜
-    h.add(_nth_weekday(year, 7, 0, 3))   # 海の日: 7月第3月曜
-    h.add(_nth_weekday(year, 9, 0, 3))   # 敬老の日: 9月第3月曜
-    h.add(_nth_weekday(year, 10, 0, 2))  # スポーツの日: 10月第2月曜
+    for r in picked[-50:]:
+        rp = r.get("realized_pct", "")
+        try:
+            v = float(rp) if rp != "" else 0.0
+        except Exception:
+            v = 0.0
+        pnl_sum += v
+        if v > 0:
+            win += 1
 
-    # 春分・秋分
-    h.add(date(year, 3, _vernal_equinox_day(year)))
-    h.add(date(year, 9, _autumnal_equinox_day(year)))
+        lines.append(
+            f"{r.get('timestamp_exit','?')} {r.get('symbol','?')} {r.get('side','?')} "
+            f"{r.get('session','?')} realized:{r.get('realized_pct','')}% reason:{r.get('exit_reason','')}"
+        )
 
-    # 振替休日（簡易：日曜に当たる祝日の翌日）
-    # ※厳密には連鎖ありだが、実務上これでほぼ問題になりにくい
-    subs = set()
-    for d in h:
-        if d.weekday() == 6:  # Sunday
-            subs.add(d + timedelta(days=1))
-    h |= subs
+    win_rate = (win / total * 100.0) if total else 0.0
 
-    # 国民の休日（祝日と祝日に挟まれた平日）
-    # 対象を広くチェック
-    for m in range(1, 13):
-        for day in range(1, 32):
-            try:
-                d = date(year, m, day)
-            except ValueError:
-                continue
-            if d in h:
-                continue
-            if (d - timedelta(days=1)) in h and (d + timedelta(days=1)) in h:
-                h.add(d)
-
-    return h
-
-def is_business_day_jp(d: date) -> bool:
-    if d.weekday() >= 5:
-        return False
-    if d in jp_holidays(d.year):
-        return False
-    return True
-
-
-def main():
-    JST = pytz.timezone("Asia/Tokyo")
-    now_jst = datetime.now(JST)
-    today = now_jst.date()
-
-    # 土日祝スキップ
-    if not is_business_day_jp(today):
-        print(f"[run_reports_daily] skip: not business day ({today})")
-        return
-
-    hook = os.getenv("DISCORD_WEBHOOK_REPORT", "")
-    msg = generate_daily_report()
-
-    if hook:
-        send_discord(hook, msg)
-    else:
-        print("[run_reports_daily] ⚠ DISCORD_WEBHOOK_REPORT 未設定")
-        print(msg)
-
-
-if __name__ == "__main__":
-    main()
+    msg = (
+        "📊 デイリーレポート（当日 0:00〜現在）\n"
+        f"集計時刻(JST): {get_jst_now_str()}\n"
+        f"件数: {total}\n"
+        f"実現損益% 合計: {pnl_sum:.2f}%\n"
+        f"勝率: {win_rate:.2f}%\n"
+        "\n--- 明細（最大50件）---\n"
+        + ("\n".join(lines) if lines else "（対象なし）")
+    )
+    return msg
